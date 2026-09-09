@@ -1,0 +1,48 @@
+# ============================================================
+# Face Recognition App — .gitignore
+# ============================================================
+
+# Môi trường ảo
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Dữ liệu nhạy cảm & runtime (không đưa lên git!)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Model ONNX (tải riêng — kích thước lớn)
+models/
+
+# Snapshot ảnh
+snapshots/
+
+# Logs
+logs/
+
+# Cấu hình cục bộ (chứa hash mật khẩu — không commit!)
+config.json
+*.local
+
+# Flutter / Dart (mobile)
+mobile/build/
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+
+# IDE
+.vscode/
+.idea/
+
+# Hệ điều hành
+Thumbs.db
+.DS_Store
