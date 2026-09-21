@@ -76,12 +76,13 @@ try:
 
     lock = window._lock_screen
 
-    # 1b) Eye toggle (FR-4): bấm 👁 → mật khẩu hiện rõ, bấm lại → ẩn
-    lock._eye_btn.click()
+    # 1b) Eye toggle (FR-4): icon mắt TRONG ô → mật khẩu hiện rõ, bấm lại → ẩn
+    assert not lock._pw1.is_revealed(), "Mặc định phải ẩn mật khẩu"
+    lock._pw1.toggle_visible()
     assert lock._pw1.echoMode() == QLineEdit.EchoMode.Normal, "Eye toggle phải hiện mật khẩu"
-    lock._eye_btn.click()
+    lock._pw1.toggle_visible()
     assert lock._pw1.echoMode() == QLineEdit.EchoMode.Password, "Eye toggle phải ẩn mật khẩu lại"
-    print("[1b] Eye toggle hiện/ẩn mật khẩu: OK")
+    print("[1b] Eye icon trong ô hiện/ẩn mật khẩu: OK")
 
     # 2) Mật khẩu yếu (không đủ chính sách FR-1) → báo lỗi, không lưu
     lock._pw1.setText("12345678")   # toàn số, không có chữ thường/hoa

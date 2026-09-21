@@ -10,18 +10,17 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from app.services.auth import AuthService
+from app.ui.widgets import PasswordEdit
 
 logger = logging.getLogger(__name__)
 
@@ -55,28 +54,11 @@ class PasswordDialog(QDialog):
             note_label.setWordWrap(True)
             layout.addWidget(note_label)
 
-        pw_row = QHBoxLayout()
-        pw_row.setSpacing(6)
-        self._pw = QLineEdit()
-        self._pw.setEchoMode(QLineEdit.EchoMode.Password)
+        # Ô mật khẩu + icon con mắt ngay trong ô (không còn nút chữ riêng)
+        self._pw = PasswordEdit()
         self._pw.setPlaceholderText("Mật khẩu")
         self._pw.returnPressed.connect(self._on_confirm)
-        pw_row.addWidget(self._pw, stretch=1)
-
-        def _toggle_visible() -> None:
-            show = self._pw.echoMode() == QLineEdit.EchoMode.Password
-            self._pw.setEchoMode(
-                QLineEdit.EchoMode.Normal
-                if show else QLineEdit.EchoMode.Password
-            )
-            eye_btn.setText("🙈 Ẩn" if show else "👁 Hiện")
-
-        eye_btn = QPushButton("👁 Hiện")
-        eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        eye_btn.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; }")
-        eye_btn.clicked.connect(_toggle_visible)
-        pw_row.addWidget(eye_btn)
-        layout.addLayout(pw_row)
+        layout.addWidget(self._pw)
 
         self._error = QLabel()
         self._error.setStyleSheet("color: #d33; font-weight: bold;")

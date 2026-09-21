@@ -37,6 +37,46 @@ class Person:
     created_at: str
     thumbnail_path: str
     thumbnail_r2_key: str | None = None
+    shift_id: str | None = None  # NULL = dùng ca mặc định (attendance-spec FR-3)
+
+
+@dataclass
+class Shift:
+    """Ca làm việc (attendance-spec FR-3): giờ quy định + dung sai trễ.
+
+    Ca đêm: ``end_time <= start_time`` (kết thúc sau nửa đêm).
+    ``factor`` = hệ số lương của ca (lương thô = số công × hệ số; schema v3).
+    """
+
+    id: str
+    name: str
+    start_time: str  # 'HH:MM' giờ địa phương
+    end_time: str    # 'HH:MM'
+    grace_minutes: int = 10
+    created_at: str = ""
+    factor: float = 1.0
+    break_start: str | None = None  # 'HH:MM' đầu nghỉ giữa ca (schema v4)
+    break_end: str | None = None    # 'HH:MM' hết nghỉ — None = không nghỉ cố định
+
+
+@dataclass
+class AttendanceDay:
+    """Bản ghi ngày công — 1 dòng / người / ngày (attendance-spec FR-1).
+
+    Giờ lưu ISO UTC; ``work_date`` là ngày bắt đầu ca (giờ địa phương).
+    Đi muộn tính lúc HIỂN THỊ (không lưu cột riêng — tránh lệch khi sửa ca).
+    """
+
+    id: str
+    person_id: str
+    work_date: str                     # 'YYYY-MM-DD'
+    shift_id: str | None = None
+    check_in_at: str | None = None     # ISO UTC; None = chưa có giờ vào
+    check_out_at: str | None = None    # None = thiếu giờ ra
+    status: str = "auto"               # auto / leave / trip / manual
+    manual_override: bool = False
+    note: str = ""
+    updated_at: str = ""
 
 
 @dataclass
@@ -204,6 +244,23 @@ class PersonRepository:
 
     def _outbox(self) -> SyncOutboxRepository:
         return SyncOutboxRepository(self._db)
+
+    def set_shift(
+        self, person_id: str, shift_id: str | None, record_outbox: bool = True
+    ) -> bool:
+        """Gán ca làm việc cho người (attendance-spec FR-3).
+
+        ``shift_id=None`` → người này dùng ca mặc định. Cột ``shift_id``
+        có khóa ngoại ON DELETE SET NULL — xóa ca tự động đưa về mặc định.
+        """
+        with self._db.session() as conn:
+            cur = conn.execute(
+                "UPDATE persons SET shift_id = ? WHERE id = ?",
+                (shift_id, person_id),
+            )
+        if cur.rowcount and record_outbox:
+            self._outbox().add("person", person_id, "upsert")
+        return cur.rowcount > 0
 
     # -- Đọc -------------------------------------------------
     def get(self, person_id: str) -> Person | None:
@@ -602,12 +659,16 @@ class SyncOutboxRepository:
 # =============================================================
 
 def _row_to_person(row: Any) -> Person:
+    # shift_id có thể vắng mặt khi schema chưa nâng cấp (DB cũ mở bằng code
+    # mới trước khi chạy executescript) — đọc an toàn qua keys().
+    shift_id = row["shift_id"] if "shift_id" in row.keys() else None
     return Person(
         id=row["id"],
         name=row["name"],
         created_at=row["created_at"],
         thumbnail_path=row["thumbnail_path"],
         thumbnail_r2_key=row["thumbnail_r2_key"],
+        shift_id=shift_id,
     )
 
 
@@ -633,3 +694,391 @@ def _row_to_event(row: Any) -> RecognitionEvent:
         snapshot_r2_key=row["snapshot_r2_key"],
         is_unknown=bool(row["is_unknown"]),
     )
+
+
+def _row_to_shift(row: Any) -> Shift:
+    return Shift(
+        id=row["id"],
+        name=row["name"],
+        start_time=row["start_time"],
+        end_time=row["end_time"],
+        grace_minutes=int(row["grace_minutes"]),
+        created_at=row["created_at"],
+        factor=float(row["factor"]),
+        break_start=row["break_start"],
+        break_end=row["break_end"],
+    )
+
+
+def _row_to_attendance_day(row: Any) -> AttendanceDay:
+    return AttendanceDay(
+        id=row["id"],
+        person_id=row["person_id"],
+        work_date=row["work_date"],
+        shift_id=row["shift_id"],
+        check_in_at=row["check_in_at"],
+        check_out_at=row["check_out_at"],
+        status=row["status"],
+        manual_override=bool(row["manual_override"]),
+        note=row["note"] or "",
+        updated_at=row["updated_at"],
+    )
+
+
+# =============================================================
+# ShiftRepository — ca làm việc (attendance-spec FR-3)
+# =============================================================
+
+class ShiftRepository:
+    """Thao tác bảng ``shifts`` (CRUD ca làm việc).
+
+    Outbox entity 'shift' — SyncService đẩy lên D1 (attendance-spec FR-9).
+    """
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    # -- Ghi -------------------------------------------------
+    def add(
+        self,
+        name: str,
+        start_time: str,
+        end_time: str,
+        grace_minutes: int = 10,
+        shift_id: str | None = None,
+        created_at: str | None = None,
+        factor: float = 1.0,
+        break_start: str | None = None,
+        break_end: str | None = None,
+        record_outbox: bool = True,
+    ) -> Shift:
+        """Thêm ca mới; ``shift_id``/``created_at`` dùng khi KÉO từ cloud về."""
+        name = name.strip()
+        if not name:
+            raise ValueError("Tên ca không được trống")
+        _validate_hhmm(start_time)
+        _validate_hhmm(end_time)
+        if bool(break_start) != bool(break_end):
+            raise ValueError("Nghỉ giữa ca cần ĐỦ giờ bắt đầu và kết thúc (HH:MM)")
+        if break_start:
+            _validate_hhmm(break_start)
+            _validate_hhmm(break_end)
+        shift = Shift(
+            id=shift_id or _new_id(),
+            name=name,
+            start_time=start_time,
+            end_time=end_time,
+            grace_minutes=max(0, int(grace_minutes)),
+            created_at=created_at or "",
+            factor=max(float(factor), 0.01),
+            break_start=break_start or None,
+            break_end=break_end or None,
+        )
+        with self._db.session() as conn:
+            conn.execute(
+                "INSERT INTO shifts (id, name, start_time, end_time, grace_minutes, factor, break_start, break_end, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))",
+                (
+                    shift.id,
+                    shift.name,
+                    shift.start_time,
+                    shift.end_time,
+                    shift.grace_minutes,
+                    shift.factor,
+                    shift.break_start,
+                    shift.break_end,
+                    shift.created_at or None,
+                ),
+            )
+        if record_outbox:
+            SyncOutboxRepository(self._db).add("shift", shift.id, "upsert")
+        logger.info("Đã thêm ca '%s' (%s–%s)", shift.name, shift.start_time, shift.end_time)
+        return shift
+
+    def update(
+        self,
+        shift_id: str,
+        name: str,
+        start_time: str,
+        end_time: str,
+        grace_minutes: int,
+        factor: float = 1.0,
+        break_start: str | None = None,
+        break_end: str | None = None,
+        record_outbox: bool = True,
+    ) -> bool:
+        """Sửa ca; ngày công ĐÃ TÍNH giữ nguyên shift_id cũ (FR-3)."""
+        name = name.strip()
+        if not name:
+            return False
+        _validate_hhmm(start_time)
+        _validate_hhmm(end_time)
+        if bool(break_start) != bool(break_end):
+            raise ValueError("Nghỉ giữa ca cần ĐỦ giờ bắt đầu và kết thúc (HH:MM)")
+        if break_start:
+            _validate_hhmm(break_start)
+            _validate_hhmm(break_end)
+        with self._db.session() as conn:
+            cur = conn.execute(
+                "UPDATE shifts SET name = ?, start_time = ?, end_time = ?,"
+                " grace_minutes = ?, factor = ?, break_start = ?, break_end = ?"
+                " WHERE id = ?",
+                (name, start_time, end_time, max(0, int(grace_minutes)),
+                 max(float(factor), 0.01), break_start or None, break_end or None,
+                 shift_id),
+            )
+        if cur.rowcount and record_outbox:
+            SyncOutboxRepository(self._db).add("shift", shift_id, "upsert")
+        return cur.rowcount > 0
+
+    def delete(self, shift_id: str, record_outbox: bool = True) -> bool:
+        """Xóa ca — persons.shift_id tự về NULL (ON DELETE SET NULL) = ca mặc định.
+
+        attendance_days.shift_id cũng SET NULL (ngày đã tính giữ nguyên số,
+        chỉ mất tham chiếu ca — đúng spec FR-3).
+        """
+        with self._db.session() as conn:
+            cur = conn.execute("DELETE FROM shifts WHERE id = ?", (shift_id,))
+        if cur.rowcount and record_outbox:
+            SyncOutboxRepository(self._db).add("shift", shift_id, "delete")
+        if cur.rowcount:
+            logger.info("Đã xóa ca %s (người gán ca này về ca mặc định)", shift_id)
+        return cur.rowcount > 0
+
+    # -- Đọc -------------------------------------------------
+    def get(self, shift_id: str) -> Shift | None:
+        with self._db.session() as conn:
+            row = conn.execute(
+                "SELECT * FROM shifts WHERE id = ?", (shift_id,)
+            ).fetchone()
+        return _row_to_shift(row) if row else None
+
+    def list_all(self) -> list[Shift]:
+        """Toàn bộ ca, ca tạo trước đứng trước (ổn định khi hiển thị combo)."""
+        with self._db.session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM shifts ORDER BY created_at ASC, name ASC"
+            ).fetchall()
+        return [_row_to_shift(r) for r in rows]
+
+    def get_by_name(self, name: str) -> Shift | None:
+        """Tìm ca theo tên (chính xác) — dùng kiểm tra trùng khi tạo."""
+        with self._db.session() as conn:
+            row = conn.execute(
+                "SELECT * FROM shifts WHERE name = ?", (name.strip(),)
+            ).fetchone()
+        return _row_to_shift(row) if row else None
+
+
+# =============================================================
+# AttendanceDayRepository — bản ghi ngày công (attendance-spec FR-1/FR-2)
+# =============================================================
+
+class AttendanceDayRepository:
+    """Thao tác bảng ``attendance_days`` (1 dòng / người / ngày).
+
+    Outbox entity 'attendance_day' — SyncService đẩy lên D1 (FR-9).
+    """
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    # -- Ghi -------------------------------------------------
+    def upsert_auto(
+        self,
+        person_id: str,
+        work_date: str,
+        check_in_at: str,
+        check_out_at: str | None,
+        shift_id: str | None,
+        record_outbox: bool = True,
+    ) -> AttendanceDay:
+        """Ghi/ cập nhật ngày công TỰ ĐỘNG từ sự kiện nhận diện (FR-2).
+
+        Lần đầu trong ngày → INSERT (check_in); các lần sau → UPDATE
+        check_out nếu mới hơn. KHÔNG đụng dòng manual_override (caller —
+        AttendanceService — kiểm tra trước). Trả về dòng sau khi ghi.
+        """
+        day_id = _new_id()
+        with self._db.session() as conn:
+            conn.execute(
+                "INSERT INTO attendance_days"
+                " (id, person_id, work_date, shift_id, check_in_at, check_out_at, status)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'auto')"
+                " ON CONFLICT(person_id, work_date) DO UPDATE SET"
+                " check_out_at = COALESCE(excluded.check_out_at, attendance_days.check_out_at),"
+                " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                (day_id, person_id, work_date, shift_id, check_in_at, check_out_at),
+            )
+            row = conn.execute(
+                "SELECT * FROM attendance_days WHERE person_id = ? AND work_date = ?",
+                (person_id, work_date),
+            ).fetchone()
+        if record_outbox:
+            SyncOutboxRepository(self._db).add("attendance_day", row["id"], "upsert")
+        return _row_to_attendance_day(row)
+
+    def save(
+        self,
+        day: AttendanceDay,
+        record_outbox: bool = True,
+    ) -> AttendanceDay:
+        """Lưu THAY ĐỔI TOÀN BỘ dòng ngày công (dùng cho sửa tay — FR-5).
+
+        Ghi outbox 'upsert' để đẩy lên D1. ``updated_at`` tự làm mới.
+        """
+        with self._db.session() as conn:
+            conn.execute(
+                "UPDATE attendance_days SET check_in_at = ?, check_out_at = ?,"
+                " status = ?, manual_override = ?, note = ?,"
+                " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                " WHERE id = ?",
+                (
+                    day.check_in_at,
+                    day.check_out_at,
+                    day.status,
+                    1 if day.manual_override else 0,
+                    day.note,
+                    day.id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM attendance_days WHERE id = ?", (day.id,)
+            ).fetchone()
+        if record_outbox:
+            SyncOutboxRepository(self._db).add("attendance_day", day.id, "upsert")
+        return _row_to_attendance_day(row) if row else day
+
+    def add_external(
+        self,
+        day: AttendanceDay,
+        record_outbox: bool = True,
+    ) -> AttendanceDay:
+        """Chèn 1 dòng ngày công từ NGOÀI (kéo từ cloud về — FR-9).
+
+        Giữ nguyên id + mọi trường; ``updated_at`` rỗng → SQL tự đặt DEFAULT.
+        Không đụng outbox khi ``record_outbox=False`` (tránh vòng lặp sync).
+        """
+        with self._db.session() as conn:
+            conn.execute(
+                "INSERT INTO attendance_days"
+                " (id, person_id, work_date, shift_id, check_in_at, check_out_at,"
+                "  status, manual_override, note, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?,"
+                "  strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))",
+                (
+                    day.id,
+                    day.person_id,
+                    day.work_date,
+                    day.shift_id,
+                    day.check_in_at,
+                    day.check_out_at,
+                    day.status,
+                    1 if day.manual_override else 0,
+                    day.note,
+                    day.updated_at or None,
+                ),
+            )
+        if record_outbox:
+            SyncOutboxRepository(self._db).add("attendance_day", day.id, "upsert")
+        return day
+
+    # -- Đọc -------------------------------------------------
+    def get(self, day_id: str) -> AttendanceDay | None:
+        with self._db.session() as conn:
+            row = conn.execute(
+                "SELECT * FROM attendance_days WHERE id = ?", (day_id,)
+            ).fetchone()
+        return _row_to_attendance_day(row) if row else None
+
+    def find(self, person_id: str, work_date: str) -> AttendanceDay | None:
+        """Dòng công của người trong 1 ngày; None nếu chưa có (chưa chấm)."""
+        with self._db.session() as conn:
+            row = conn.execute(
+                "SELECT * FROM attendance_days WHERE person_id = ? AND work_date = ?",
+                (person_id, work_date),
+            ).fetchone()
+        return _row_to_attendance_day(row) if row else None
+
+    def list_all(self) -> list[AttendanceDay]:
+        """Toàn bộ ngày công (dùng cho đợt đồng bộ ĐẦU TIÊN — FR-9)."""
+        with self._db.session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM attendance_days ORDER BY work_date ASC, person_id ASC"
+            ).fetchall()
+        return [_row_to_attendance_day(r) for r in rows]
+
+    def list_month(self, year: int, month: int, person_id: str = "") -> list[AttendanceDay]:
+        """Ngày công trong tháng (mọi người hoặc 1 người) — dùng bảng tháng FR-7."""
+        date_prefix = f"{year:04d}-{month:02d}-"
+        sql = "SELECT * FROM attendance_days WHERE work_date LIKE ?"
+        params: list[Any] = [f"{date_prefix}%"]
+        if person_id:
+            sql += " AND person_id = ?"
+            params.append(person_id)
+        sql += " ORDER BY work_date ASC, person_id ASC"
+        with self._db.session() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_row_to_attendance_day(r) for r in rows]
+
+
+# =============================================================
+# AttendanceAuditRepository — lịch sử sửa tay (attendance-spec FR-5, KHÔNG sync)
+# =============================================================
+
+class AttendanceAuditRepository:
+    """Lịch sử sửa bản ghi công — log CỤC BỘ, không đồng bộ D1 (FR-9)."""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    def add(
+        self,
+        attendance_day_id: str,
+        action: str,
+        old_value: str = "",
+        new_value: str = "",
+        detail: str = "",
+    ) -> None:
+        """Ghi 1 dòng audit; ``action``: edit_time / set_status / add_note."""
+        if action not in ("edit_time", "set_status", "add_note"):
+            raise ValueError(f"Hành động audit không hợp lệ: {action}")
+        with self._db.session() as conn:
+            conn.execute(
+                "INSERT INTO attendance_audit"
+                " (id, attendance_day_id, action, old_value, new_value, detail)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (_new_id(), attendance_day_id, action, old_value, new_value, detail),
+            )
+
+    def list_for_day(self, attendance_day_id: str) -> list[dict[str, str]]:
+        """Audit của 1 ngày, MỚI NHẤT TRƯỚC (dict: action/old/new/edited_at/detail)."""
+        with self._db.session() as conn:
+            rows = conn.execute(
+                "SELECT action, old_value, new_value, edited_at, detail"
+                " FROM attendance_audit WHERE attendance_day_id = ?"
+                " ORDER BY edited_at DESC",
+                (attendance_day_id,),
+            ).fetchall()
+        return [
+            {
+                "action": r["action"],
+                "old_value": r["old_value"],
+                "new_value": r["new_value"],
+                "edited_at": r["edited_at"],
+                "detail": r["detail"],
+            }
+            for r in rows
+        ]
+
+
+def _validate_hhmm(value: str) -> None:
+    """Kiểm tra chuỗi giờ 'HH:MM' hợp lệ (00:00–23:59); sai → ValueError."""
+    try:
+        hours, minutes = value.strip().split(":")
+        if len(hours) != 2 or len(minutes) != 2:
+            raise ValueError
+        if not (0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError(f"Giờ không hợp lệ (cần dạng HH:MM): {value!r}") from None

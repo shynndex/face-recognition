@@ -28,6 +28,7 @@ from app.infrastructure.repositories import (
     RecognitionEventRepository,
 )
 from app.core.matcher import CosineMatcher, MatchResult
+from app.services.attendance import AttendanceService
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,13 @@ SNAPSHOT_DIR = DATA_DIR / "snapshots"
 
 
 class RecognitionService:
-    """So khớp khuôn mặt với danh sách đã đăng ký + ghi lịch sử nhận diện."""
+    """So khớp khuôn mặt với danh sách đã đăng ký + ghi lịch sử nhận diện.
+
+    ĐIỂM NỐI CHẤM CÔNG (attendance-spec FR-2): CameraView (webcam) và
+    PhotoView (ảnh) đều ghi sự kiện qua ``save_event`` — nên việc cập nhật
+    ngày công cũng nằm ở đây (một chỗ, phủ cả 2 nguồn). SyncService._pull
+    tự nối riêng cho sự kiện mobile kéo từ cloud về.
+    """
 
     def __init__(self, db: Database) -> None:
         self._samples = FaceSampleRepository(db)
@@ -43,6 +50,9 @@ class RecognitionService:
         self._events = RecognitionEventRepository(db)
         self._matcher = CosineMatcher()
         self._names: dict[str, str] = {}
+        # Tạo MỘT LẦN (không mỗi sự kiện) — AttendanceService tự đảm bảo
+        # ca mặc định tồn tại; on_event bên trong bắt mọi lỗi nên luôn mềm.
+        self._attendance = AttendanceService(db)
 
     # ---------------------------------------------------------
     # Nạp dữ liệu & so khớp
@@ -105,7 +115,7 @@ class RecognitionService:
                 label = "Người lạ"
 
             snapshot_path = self._save_snapshot(face_crop)
-            return self._events.add(
+            event_id = self._events.add(
                 person_id=person_id,
                 label=label,
                 source=source,
@@ -113,6 +123,12 @@ class RecognitionService:
                 snapshot_path=snapshot_path,
                 is_unknown=is_unknown,
             )
+            # Chấm công (attendance-spec FR-2): CHỈ sự kiện XÁC NHẬN của người
+            # đã biết (không phải giả mạo/mặt bị che/người lạ) mới cập nhật
+            # ngày công. on_event bắt mọi lỗi nên không giết luồng nhận diện.
+            if person_id is not None and not is_spoof and not is_occluded:
+                self._attendance.on_event(person_id)
+            return event_id
         except Exception:  # noqa: BLE001 — lỗi ghi log KHÔNG được làm chết camera
             logger.exception("Lỗi ghi sự kiện nhận diện")
             return None

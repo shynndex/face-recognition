@@ -1,7 +1,24 @@
 # Spec: Quản lý mật khẩu (Password Management)
 
-> Trạng thái: DRAFT — kết quả phỏng vấn người dùng (5 vòng, 2026-09-03). Chưa có code thay đổi.
+> Trạng thái: **DONE** — đã triển khai đủ FR-1…FR-8 (ngày 2026-09-21, xem bảng trạng thái ở mục 0).
 > Mục tiêu của spec: làm rõ **"thêm xử lý cho việc quản lý mật khẩu"** — xử lý khi **quên mật khẩu**, chính sách mật khẩu **mạnh hơn**, và cải thiện **trải nghiệm xác thực**.
+
+---
+
+## 0. Trạng thái triển khai (cập nhật 2026-09-21 — đã đối chiếu mã trên đĩa)
+
+| FR | Nội dung | Trạng thái | File |
+|---|---|---|---|
+| FR-1 | Chính sách mật khẩu MỚI: ≥ 8 ký tự + chữ thường/hoa/số; mật khẩu CŨ yếu vẫn mở khóa bình thường; `validate_password_strength` dùng chung | ✅ Xong | `app/services/auth.py`, `app/ui/lock_screen.py`, `app/ui/settings_view.py` (`ChangePasswordDialog`) |
+| FR-2 | Khóa MỀM thay khóa cứng 60s: 5 lần sai liên tiếp → chờ 10s giữa 2 lần thử; bộ đếm DÙNG CHUNG mật khẩu + câu hỏi bảo mật | ✅ Xong | `app/services/auth.py` (`SOFT_LOCK_AFTER=5`, `SOFT_LOCK_WAIT_SECONDS=10`) |
+| FR-3 | Hiển thị "còn N lần thử" + đếm ngược "Thử lại sau X giây" (QTimer) | ✅ Xong | `app/ui/lock_screen.py`, `app/ui/password_dialog.py` |
+| FR-4 | Eye toggle hiện/ẩn mọi ô mật khẩu (`PasswordEdit` — icon mắt ngay trong ô, mặc định ẩn) | ✅ Xong | `app/ui/widgets.py`, `app/ui/lock_screen.py`, `app/ui/password_dialog.py`, `app/ui/settings_view.py` |
+| FR-5 | 2 câu hỏi bảo mật (hash argon2 riêng từng câu; so khớp trim + gộp khoảng trắng + lowercase, KHÔNG bỏ dấu) + nút **"Đổi câu hỏi bảo mật"** ở Cài đặt (xác thực mật khẩu cũ trước) | ✅ Xong | `app/services/auth.py` (`set_security_questions`, `verify_security_answers`, `normalize_answer`), `app/ui/lock_screen.py`, `app/ui/settings_view.py` (`SecurityQuestionsDialog`) |
+| FR-6 | "Quên mật khẩu?" chỉ ở màn hình khóa; trả lời đúng CẢ 2 câu → đặt lại (chính sách FR-1); sai chịu cooldown cùng bộ đếm; nâng cấp: user cũ thiếu câu hỏi bị BẮT khai trước khi vào app | ✅ Xong | `app/ui/lock_screen.py` (4 chế độ: setup / unlock / upgrade_unlock→upgrade_questions / recovery) |
+| FR-7 | Tự khóa khi không dùng: combo Tắt/1/5/15 phút (mặc định Tắt); QTimer 1s trong MainWindow; CHỈ phím/chuột trong cửa sổ reset (camera chạy không reset — đã chốt); đang ở LockScreen thì không đếm; hover/di chuột không tính | ✅ Xong | `app/ui/main_window.py` (`_check_idle_lock`, `eventFilter`), `app/ui/settings_view.py` (combo idle), `app/config.py` (`idle_lock_minutes`) |
+| FR-8 | Lưu trong `config.json`: `security_question_1/2`, `security_answer_hash_1/2`, `idle_lock_minutes`; config cũ thiếu field tự điền mặc định, không crash | ✅ Xong | `app/config.py` |
+
+**Test:** `scripts/test_auth.py` (logic xác thực — chính sách mới, khóa mềm 10s, câu hỏi bảo mật hash + không bỏ dấu, bộ đếm dùng chung), `scripts/step_02_gui_test.py` (LockScreen 4 chế độ + PasswordDialog + eye toggle + "còn N lần" + cooldown + luồng nâng cấp/khôi phục), `scripts/test_password_management.py` (8 — FR-5 `SecurityQuestionsDialog` validate/lưu/đổi câu hỏi + FR-7 combo Tắt/1/5/15, lưu/load config, tự khóa đúng giờ, hover không reset, mở khóa reset bộ đếm). Các test cũ khác (repository, chấm công, dashboard, theme…) không bị ảnh hưởng — đều pass.
 
 ---
 
@@ -128,7 +145,7 @@
 
 ---
 
-## 5. Thay đổi dự kiến theo file (chưa code)
+## 5. Thay đổi theo file (ĐÃ CODE — đối chiếu 2026-09-21)
 
 - `app/services/auth.py`:
   - hằng số mới: `MIN_PASSWORD_LENGTH = 8` (thay 4), yêu cầu chữ thường/hoa/số; bỏ `MAX_ATTEMPTS`/`LOCKOUT_SECONDS` cứng hoặc thay bằng `SOFT_LOCK_AFTER = 5`, `SOFT_LOCK_WAIT_SECONDS = 10`;
@@ -182,15 +199,15 @@
 
 ---
 
-## 10. Định nghĩa "hoàn thành" (acceptance criteria)
-- [ ] Tạo mật khẩu mới phải tuân FR-1; mật khẩu cũ ngắn vẫn mở khóa được.
-- [ ] Sau 5 lần sai → các lần thử sau phải chờ 10s; không còn khóa 60s; đúng mật khẩu thì reset đếm.
-- [ ] Màn hình khóa hiển thị "còn N lần thử" và đếm ngược cooldown.
-- [ ] Eye toggle hoạt động ở mọi ô mật khẩu (FR-4).
-- [ ] Đặt lần đầu bắt buộc 2 câu hỏi bảo mật; trả lời lưu dạng hash.
-- [ ] "Quên mật khẩu?" chỉ ở màn hình khóa; trả lời đúng cả 2 câu → đặt lại được mật khẩu (đúng FR-1); sai vẫn chịu cooldown (cùng bộ đếm).
-- [ ] So khớp câu trả lời: trim + lowercase, KHÔNG bỏ dấu tiếng Việt.
-- [ ] Nâng cấp: user cũ (có mật khẩu, thiếu câu hỏi) bị yêu cầu khai 2 câu hỏi ở lần mở app đầu sau nâng cấp trước khi vào app.
-- [ ] Cài đặt có mục tự khóa (Tắt/1/5/15 phút, mặc định Tắt) và hoạt động đúng — vẫn đếm khi camera chạy, chỉ phím/chuột reset.
-- [ ] `config.json` cũ không crash khi thiếu field mới; dữ liệu người/lịch sử không đổi.
-- [ ] Không có bất kỳ thay đổi nào về luồng đồng bộ D1 hiện tại (auth không lên cloud ở bản này).
+## 10. Định nghĩa "hoàn thành" (acceptance criteria) — tất cả ĐÃ ĐẠT qua test
+- [x] Tạo mật khẩu mới phải tuân FR-1; mật khẩu cũ ngắn vẫn mở khóa được. (`test_auth.py` [2][3])
+- [x] Sau 5 lần sai → các lần thử sau phải chờ 10s; không còn khóa 60s; đúng mật khẩu thì reset đếm. (`test_auth.py` [5])
+- [x] Màn hình khóa hiển thị "còn N lần thử" và đếm ngược cooldown. (`step_02_gui_test.py` [6][10][10b])
+- [x] Eye toggle hoạt động ở mọi ô mật khẩu (FR-4). (`step_02_gui_test.py` [1b] — icon mắt trong ô `PasswordEdit`)
+- [x] Đặt lần đầu bắt buộc 2 câu hỏi bảo mật; trả lời lưu dạng hash. (`step_02_gui_test.py` [4], `test_auth.py` [6])
+- [x] "Quên mật khẩu?" chỉ ở màn hình khóa; trả lời đúng cả 2 câu → đặt lại được mật khẩu (đúng FR-1); sai vẫn chịu cooldown (cùng bộ đếm). (`step_02_gui_test.py` [11][11b], `test_auth.py` [7])
+- [x] So khớp câu trả lời: trim + lowercase, KHÔNG bỏ dấu tiếng Việt. (`test_auth.py` [6] — "hà nội" ≠ "ha noi")
+- [x] Nâng cấp: user cũ (có mật khẩu, thiếu câu hỏi) bị yêu cầu khai 2 câu hỏi ở lần mở app đầu sau nâng cấp trước khi vào app. (`step_02_gui_test.py` [12] — chế độ upgrade_unlock → upgrade_questions)
+- [x] Cài đặt có mục tự khóa (Tắt/1/5/15 phút, mặc định Tắt) và hoạt động đúng — vẫn đếm khi camera chạy, chỉ phím/chuột reset. (`test_password_management.py` [2][3][4][5] — hover/di chuột không reset, mở khóa coi như vừa tương tác)
+- [x] `config.json` cũ không crash khi thiếu field mới; dữ liệu người/lịch sử không đổi. (`Config.load` chỉ nhận key hợp lệ trong dataclass, giá trị None bỏ qua — tự điền mặc định)
+- [x] Không có bất kỳ thay đổi nào về luồng đồng bộ D1 hiện tại (auth không lên cloud ở bản này).

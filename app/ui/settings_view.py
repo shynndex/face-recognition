@@ -7,6 +7,9 @@ Các nhóm cài đặt (mỗi nhóm một QFrame#card):
     hiển thị giá trị thời gian thực + giải thích hướng chỉnh.
   - BẢO MẬT: [Đổi mật khẩu] → PasswordDialog xác thực mật khẩu CŨ → dialog
     nhập mật khẩu MỚI 2 lần → cập nhật hash trong config.json (FR-11).
+    Kèm hàng "Câu hỏi bảo mật" + [Đổi câu hỏi bảo mật] (FR-5 — cũng xác
+    thực mật khẩu cũ) và combo "Tự khóa khi không dùng" FR-7 (Tắt/1/5/15
+    phút → config.idle_lock_minutes).
   - ĐỒNG BỘ CLOUD: bật/tắt đồng bộ (FR-11 — cần mật khẩu); logic đồng bộ
     thật ở Bước 15, nút [Đồng bộ ngay] tạm khóa tới khi có SyncService.
 
@@ -24,9 +27,11 @@ import time
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDoubleSpinBox,
     QComboBox,
     QDialog,
     QFrame,
+    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -34,6 +39,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -51,6 +57,7 @@ from app.services.auth import (
 )
 from app.services.sync import SyncService
 from app.ui.password_dialog import PasswordDialog
+from app.ui.widgets import PasswordEdit
 
 logger = logging.getLogger(__name__)
 
@@ -178,36 +185,16 @@ class ChangePasswordDialog(QDialog):
         title.setWordWrap(True)
         layout.addWidget(title)
 
-        def _make_row(edit: QLineEdit, eye_btn: QPushButton) -> QHBoxLayout:
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            row.addWidget(edit, stretch=1)
-            row.addWidget(eye_btn)
-            return row
-
-        self._pw1 = QLineEdit()
-        self._pw1.setEchoMode(QLineEdit.EchoMode.Password)
+        # Ô mật khẩu + icon con mắt ngay trong ô (không còn nút chữ riêng)
+        self._pw1 = PasswordEdit()
         self._pw1.setPlaceholderText("Mật khẩu mới")
         self._pw1.returnPressed.connect(self._on_confirm)
-        eye1 = QPushButton("👁")
-        eye1.setCursor(Qt.CursorShape.PointingHandCursor)
-        eye1.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; }")
-        eye1.clicked.connect(
-            lambda: self._toggle_visible(self._pw1, eye1)
-        )
-        layout.addLayout(_make_row(self._pw1, eye1))
+        layout.addWidget(self._pw1)
 
-        self._pw2 = QLineEdit()
-        self._pw2.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw2 = PasswordEdit()
         self._pw2.setPlaceholderText("Nhập lại mật khẩu mới")
         self._pw2.returnPressed.connect(self._on_confirm)
-        eye2 = QPushButton("👁")
-        eye2.setCursor(Qt.CursorShape.PointingHandCursor)
-        eye2.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; }")
-        eye2.clicked.connect(
-            lambda: self._toggle_visible(self._pw2, eye2)
-        )
-        layout.addLayout(_make_row(self._pw2, eye2))
+        layout.addWidget(self._pw2)
 
         self._error = QLabel()
         self._error.setStyleSheet("color: #d33; font-weight: bold;")
@@ -228,15 +215,6 @@ class ChangePasswordDialog(QDialog):
 
         self._pw1.setFocus()
 
-    @staticmethod
-    def _toggle_visible(edit: QLineEdit, btn: QPushButton) -> None:
-        """Bật/tắt hiện mật khẩu của một ô (FR-4)."""
-        show = edit.echoMode() == QLineEdit.EchoMode.Password
-        edit.setEchoMode(
-            QLineEdit.EchoMode.Normal if show else QLineEdit.EchoMode.Password
-        )
-        btn.setText("🙈" if show else "👁")
-
     def _on_confirm(self) -> None:
         new_pw = self._pw1.text()
         errors = validate_password_strength(new_pw)
@@ -255,6 +233,88 @@ class ChangePasswordDialog(QDialog):
     def new_password(self) -> str:
         """Mật khẩu mới đã xác nhận (gọi sau khi exec() trả Accepted)."""
         return self._pw1.text()
+
+
+class SecurityQuestionsDialog(QDialog):
+    """Nhập/cập nhật 2 câu hỏi bảo mật (spec quản lý mật khẩu — FR-5).
+
+    Mở từ Cài đặt → BẢO MẬT sau khi đã xác thực mật khẩu cũ qua
+    PasswordDialog; câu hỏi cũ được điền sẵn (giữ nguyên được),
+    câu trả lời phải nhập lại (chỉ lưu hash argon2 — không plaintext).
+    """
+
+    def __init__(self, auth: AuthService, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._auth = auth
+        self.setWindowTitle("ĐỔI CÂU HỎI BẢO MẬT")
+        self.setModal(True)
+        self.setFixedWidth(440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+
+        warn = QLabel(
+            "Dùng để KHÔI PHỤC mật khẩu khi quên (màn hình khóa → 'Quên mật khẩu?'). "
+            "Câu trả lời chỉ lưu dạng hash — hãy nhớ kỹ; quên cả câu trả lời thì "
+            "không đặt lại được mật khẩu."
+        )
+        warn.setStyleSheet("font-size: 12px; color: #b06a00;")
+        warn.setWordWrap(True)
+        layout.addWidget(warn)
+
+        cfg = auth.config
+        self._q1_edit = QLineEdit(cfg.security_question_1)
+        self._q1_edit.setPlaceholderText("Câu hỏi bảo mật 1 (vd: Quê quán của bạn?)")
+        self._a1_edit = QLineEdit()
+        self._a1_edit.setPlaceholderText("Câu trả lời 1 (≥3 ký tự, phân biệt dấu)")
+        self._q2_edit = QLineEdit(cfg.security_question_2)
+        self._q2_edit.setPlaceholderText("Câu hỏi bảo mật 2 (khác câu 1)")
+        self._a2_edit = QLineEdit()
+        self._a2_edit.setPlaceholderText("Câu trả lời 2")
+
+        form = QFormLayout()
+        form.addRow("Câu hỏi 1:", self._q1_edit)
+        form.addRow("Trả lời 1:", self._a1_edit)
+        form.addRow("Câu hỏi 2:", self._q2_edit)
+        form.addRow("Trả lời 2:", self._a2_edit)
+        layout.addLayout(form)
+
+        self._error = QLabel()
+        self._error.setStyleSheet("color: #d33; font-weight: bold;")
+        self._error.setWordWrap(True)
+        self._error.setVisible(False)
+        layout.addWidget(self._error)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Hủy")
+        cancel.clicked.connect(self.reject)
+        confirm = QPushButton("Lưu câu hỏi")
+        confirm.setDefault(True)
+        confirm.clicked.connect(self._on_confirm)
+        buttons.addWidget(cancel)
+        buttons.addWidget(confirm)
+        layout.addLayout(buttons)
+
+        self._a1_edit.setFocus()
+
+    def _on_confirm(self) -> None:
+        """Lưu qua AuthService.set_security_questions (validate + hash)."""
+        try:
+            self._auth.set_security_questions(
+                self._q1_edit.text(), self._a1_edit.text(),
+                self._q2_edit.text(), self._a2_edit.text(),
+            )
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        logger.info("Đã đổi câu hỏi bảo mật qua Cài đặt")
+        self.accept()
+
+    def _show_error(self, message: str) -> None:
+        self._error.setText(message)
+        self._error.setVisible(True)
 
 
 class SettingsView(QWidget):
@@ -279,8 +339,13 @@ class SettingsView(QWidget):
         self._probe_worker: CameraProbeWorker | None = None
         self._cloud_thread: QThread | None = None
         self._cloud_worker: QObject | None = None
+        # Service chấm công (CRUD ca, ca mặc định — attendance-spec FR-3)
+        from app.services.attendance import AttendanceService
+
+        self._attendance = AttendanceService(sync.db)
         self._build_ui()
         self._load_from_config()
+        self._refresh_shifts()
 
     # ---------------------------------------------------------
     # Giao diện (wireframe 5.5.7)
@@ -421,6 +486,100 @@ class SettingsView(QWidget):
         recog_grid.addWidget(self._clahe_check, 6, 0, 1, 3)
         layout.addWidget(recog_card)
 
+        # ---- CHẤM CÔNG (attendance-spec FR-3/FR-6) ----
+        # CRUD ca + ca mặc định (lưu DB, nút Lưu riêng) + ngày làm việc
+        # (lưu config.json, áp khi bấm [Lưu thay đổi] chung).
+        att_card = QFrame()
+        att_card.setObjectName("card")
+        att_card.setStyleSheet("border-radius: 10px;")
+        att_layout = QVBoxLayout(att_card)
+        att_layout.setContentsMargins(16, 12, 16, 12)
+        att_layout.setSpacing(8)
+
+        att_header = QLabel("── CHẤM CÔNG ──")
+        att_header.setObjectName("sectionTitle")
+        att_layout.addWidget(att_header)
+
+        self._shifts_label = QLabel("Ca làm việc: (đang tải...)")
+        self._shifts_label.setStyleSheet("font-size: 13px;")
+        self._shifts_label.setWordWrap(True)
+        att_layout.addWidget(self._shifts_label)
+
+        shift_btn_row = QHBoxLayout()
+        self._add_shift_btn = QPushButton("＋ Thêm ca")
+        self._add_shift_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._add_shift_btn.setObjectName("secondaryBtn")
+        self._add_shift_btn.setStyleSheet("border-radius: 5px; padding: 5px 14px; font-size: 12px;")
+        self._add_shift_btn.clicked.connect(self._on_add_shift)
+        shift_btn_row.addWidget(self._add_shift_btn)
+
+        self._edit_shift_btn = QPushButton("Sửa ca")
+        self._edit_shift_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._edit_shift_btn.setObjectName("secondaryBtn")
+        self._edit_shift_btn.setStyleSheet("border-radius: 5px; padding: 5px 14px; font-size: 12px;")
+        self._edit_shift_btn.clicked.connect(self._on_edit_shift)
+        shift_btn_row.addWidget(self._edit_shift_btn)
+
+        self._del_shift_btn = QPushButton("Xóa ca")
+        self._del_shift_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._del_shift_btn.setObjectName("dangerBtn")
+        self._del_shift_btn.setStyleSheet("border-radius: 5px; padding: 5px 14px; font-size: 12px;")
+        self._del_shift_btn.clicked.connect(self._on_delete_shift)
+        shift_btn_row.addWidget(self._del_shift_btn)
+        shift_btn_row.addStretch(1)
+        att_layout.addLayout(shift_btn_row)
+
+        default_row = QHBoxLayout()
+        default_row.addWidget(QLabel("Ca mặc định (người chưa gán):"))
+        self._default_shift_combo = QComboBox()
+        self._default_shift_combo.setToolTip("Ca áp dụng cho người chưa được gán ca riêng")
+        default_row.addWidget(self._default_shift_combo, stretch=1)
+        att_layout.addLayout(default_row)
+
+        # Ngày làm việc trong tuần (config.attendance_workdays — FR-6)
+        workdays_row = QHBoxLayout()
+        workdays_row.addWidget(QLabel("Ngày làm việc:"))
+        self._workday_checks: list[QCheckBox] = []
+        for day_name in ("T2", "T3", "T4", "T5", "T6", "T7", "CN"):
+            cb = QCheckBox(day_name)
+            workdays_row.addWidget(cb)
+            self._workday_checks.append(cb)
+        workdays_row.addStretch(1)
+        att_layout.addLayout(workdays_row)
+
+        # Đơn giá 1 công quy đổi (VND) — lương thô = công quy đổi × đơn giá
+        rate_row = QHBoxLayout()
+        rate_row.addWidget(QLabel("Đơn giá 1 công (VND):"))
+        self._pay_rate_spin = QSpinBox()
+        self._pay_rate_spin.setRange(0, 100_000_000)
+        self._pay_rate_spin.setSingleStep(10_000)
+        self._pay_rate_spin.setValue(self._config.attendance_pay_rate)
+        self._pay_rate_spin.setToolTip(
+            "Tiền cho 1 công quy đổi (VD 350000). Lương = số công × hệ số ca × đơn giá. "
+            "Để 0 nếu chỉ cần công quy đổi, không ra tiền."
+        )
+        rate_row.addWidget(self._pay_rate_spin, stretch=1)
+        att_layout.addLayout(rate_row)
+
+        att_btn_row = QHBoxLayout()
+        att_btn_row.addStretch(1)
+        self._save_att_btn = QPushButton("Lưu ca mặc định + ngày làm việc")
+        self._save_att_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_att_btn.setObjectName("primaryBtn")
+        self._save_att_btn.setStyleSheet("border-radius: 6px; padding: 6px 16px; font-size: 12px;")
+        self._save_att_btn.clicked.connect(self._on_save_attendance)
+        att_btn_row.addWidget(self._save_att_btn)
+        att_layout.addLayout(att_btn_row)
+
+        att_hint = QLabel(
+            "Ca lưu vào CSDL (đẩy lên cloud khi đồng bộ). Gán ca cho từng người ở "
+            "trang Danh sách người. Ca đêm: giờ ra nhỏ hơn hoặc bằng giờ vào."
+        )
+        att_hint.setStyleSheet("font-size: 11px;")
+        att_hint.setWordWrap(True)
+        att_layout.addWidget(att_hint)
+        layout.addWidget(att_card)
+
         # ---- BẢO MẬT ----
         security_card = QFrame()
         security_card.setObjectName("card")
@@ -448,6 +607,36 @@ class SettingsView(QWidget):
         pw_row.addWidget(change_pw_btn)
 
         sec_layout.addLayout(pw_row)
+
+        # Câu hỏi bảo mật + nút đổi (FR-5 — cần xác thực mật khẩu cũ)
+        sq_row = QHBoxLayout()
+        sq_row.addWidget(QLabel("Câu hỏi bảo mật:"))
+        self._sq_status = QLabel()
+        self._sq_status.setStyleSheet("font-size: 12px;")
+        sq_row.addWidget(self._sq_status)
+        sq_row.addStretch(1)
+
+        change_sq_btn = QPushButton("Đổi câu hỏi bảo mật")
+        change_sq_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        change_sq_btn.setObjectName("secondaryBtn")
+        change_sq_btn.setStyleSheet("border-radius: 5px; padding: 5px 14px; font-size: 12px;")
+        change_sq_btn.clicked.connect(self._on_change_security_questions)
+        sq_row.addWidget(change_sq_btn)
+        sec_layout.addLayout(sq_row)
+
+        # Tự khóa khi không dùng (FR-7): Tắt / 1 / 5 / 15 phút (mặc định Tắt)
+        idle_row = QHBoxLayout()
+        idle_row.addWidget(QLabel("Tự khóa khi không dùng:"))
+        self._idle_combo = QComboBox()
+        for minutes in (0, 1, 5, 15):
+            label = "Tắt" if minutes == 0 else (
+                "1 phút" if minutes == 1 else f"{minutes} phút"
+            )
+            self._idle_combo.addItem(label, minutes)
+        idle_row.addWidget(self._idle_combo)
+        idle_row.addStretch(1)
+        sec_layout.addLayout(idle_row)
+
         layout.addWidget(security_card)
 
         # ---- ĐỒNG BỘ CLOUD (Bước 15) ----
@@ -605,6 +794,12 @@ class SettingsView(QWidget):
         self._smoothing_slider.setValue(self._config.smoothing_window)
         self._update_smoothing_label()
 
+        # Ngày làm việc (attendance-spec FR-6) + đơn giá lương thô
+        workdays = set(self._config.attendance_workdays or [0, 1, 2, 3, 4])
+        for i, cb in enumerate(self._workday_checks):
+            cb.setChecked(i in workdays)
+        self._pay_rate_spin.setValue(self._config.attendance_pay_rate)
+
         self._sync_check.blockSignals(True)
         self._sync_check.setChecked(self._config.sync_enabled)
         self._sync_check.blockSignals(False)
@@ -624,6 +819,14 @@ class SettingsView(QWidget):
             self._pw_status.setText("✓ Đã đặt mật khẩu")
         else:
             self._pw_status.setText("Chưa đặt mật khẩu")
+
+        # Tự khóa khi không dùng (FR-7) + trạng thái câu hỏi bảo mật
+        idle_index = self._idle_combo.findData(self._config.idle_lock_minutes)
+        self._idle_combo.setCurrentIndex(idle_index if idle_index >= 0 else 0)
+        if self._auth.has_security_questions:
+            self._sq_status.setText("✓ Đã thiết lập 2 câu hỏi")
+        else:
+            self._sq_status.setText("Chưa thiết lập — không khôi phục được khi quên mật khẩu")
 
     def _update_threshold_label(self) -> None:
         self._threshold_label.setText(f"{self._threshold_slider.value() / 100:.2f}")
@@ -704,6 +907,27 @@ class SettingsView(QWidget):
         self._pw_status.setText("✓ Đã đặt mật khẩu")
         logger.info("Đã đổi mật khẩu qua Cài đặt")
         QMessageBox.information(self, "Thành công", "Đã đổi mật khẩu mới.")
+
+    def _on_change_security_questions(self) -> None:
+        """Đổi câu hỏi bảo mật: xác thực mật khẩu cũ → dialog 2 câu (FR-5)."""
+        if not self._auth.has_password:
+            QMessageBox.warning(
+                self, "Chưa có mật khẩu", "Hãy đặt mật khẩu trước khi tạo câu hỏi bảo mật."
+            )
+            return
+        if not PasswordDialog.require(
+            self._auth,
+            "Đổi câu hỏi bảo mật",
+            self,
+            note="Nhập mật khẩu hiện tại để tiếp tục.",
+        ):
+            return
+        dialog = SecurityQuestionsDialog(self._auth, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._sq_status.setText("✓ Đã thiết lập 2 câu hỏi")
+        logger.info("Đã đổi câu hỏi bảo mật qua Cài đặt")
+        QMessageBox.information(self, "Thành công", "Đã lưu câu hỏi bảo mật mới.")
 
     def _on_sync_toggled(self, state: int) -> None:
         """Bật/tắt cloud = thay đổi nhạy cảm → cần mật khẩu (FR-11).
@@ -816,6 +1040,118 @@ class SettingsView(QWidget):
         """Cập nhật nhãn trạng thái đồng bộ (MainWindow gọi sau auto-sync)."""
         self._sync_status.setText(text)
 
+    # ---------------------------------------------------------
+    # CHẤM CÔNG — CRUD ca + ca mặc định (attendance-spec FR-3/FR-6)
+    # ---------------------------------------------------------
+    def _refresh_shifts(self) -> None:
+        """Đọc lại danh sách ca từ DB → nhãn + combo ca mặc định."""
+        from app.services.attendance import KEY_DEFAULT_SHIFT
+
+        self._shifts = self._attendance.list_shifts()
+        if self._shifts:
+            self._shifts_label.setText(
+                "Ca làm việc: "
+                + ";  ".join(
+                    f"{s.name} ({s.start_time}–{s.end_time})" for s in self._shifts
+                )
+            )
+        else:
+            self._shifts_label.setText("Ca làm việc: chưa có ca nào")
+
+        # Combo ca mặc định: giữ lựa chọn cũ nếu ca vẫn còn
+        default_id = self._attendance._get_setting(KEY_DEFAULT_SHIFT)
+        self._default_shift_combo.blockSignals(True)
+        self._default_shift_combo.clear()
+        for i, shift in enumerate(self._shifts):
+            self._default_shift_combo.addItem(
+                f"{shift.name} ({shift.start_time}–{shift.end_time})", shift.id
+            )
+        if default_id:
+            index = self._default_shift_combo.findData(default_id)
+            if index >= 0:
+                self._default_shift_combo.setCurrentIndex(index)
+        self._default_shift_combo.blockSignals(False)
+
+    def _on_add_shift(self) -> None:
+        """Thêm ca mới qua ShiftDialog (tên/giờ/dung sai — validate trong service)."""
+        dialog = ShiftDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self._attendance.create_shift(
+                dialog.name(), dialog.start(), dialog.end(), dialog.grace(),
+                dialog.factor(),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Không thêm được ca", str(exc))
+            return
+        logger.info("Đã thêm ca '%s' qua Cài đặt", dialog.name())
+        self._refresh_shifts()
+
+    def _on_edit_shift(self) -> None:
+        """Sửa ca đang chọn trong combo ca mặc định (danh sách ca ngắn — chọn
+        qua combo đơn giản hơn bảng)."""
+        shift_id = self._default_shift_combo.currentData()
+        if shift_id is None:
+            QMessageBox.information(self, "Sửa ca", "Chưa có ca nào để sửa.")
+            return
+        shift = next(s for s in self._shifts if s.id == shift_id)
+        dialog = ShiftDialog(self, shift=shift)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self._attendance.update_shift(
+                shift_id, dialog.name(), dialog.start(), dialog.end(),
+                dialog.grace(), dialog.factor(),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Không sửa được ca", str(exc))
+            return
+        self._refresh_shifts()
+
+    def _on_delete_shift(self) -> None:
+        """Xóa ca đang chọn — xác nhận; người gán ca này về ca mặc định (FR-3)."""
+        shift_id = self._default_shift_combo.currentData()
+        if shift_id is None:
+            QMessageBox.information(self, "Xóa ca", "Chưa có ca nào để xóa.")
+            return
+        shift = next(s for s in self._shifts if s.id == shift_id)
+        answer = QMessageBox.question(
+            self,
+            "Xác nhận xóa ca",
+            f"Xóa ca '{shift.name}'?\n\nNgười đang gán ca này sẽ chuyển về ca mặc định. "
+            "Ngày công đã tính không đổi.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._attendance.delete_shift(shift_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Không xóa được", str(exc))
+            return
+        logger.info("Đã xóa ca '%s' qua Cài đặt", shift.name)
+        self._refresh_shifts()
+
+    def _on_save_attendance(self) -> None:
+        """Lưu ca mặc định (settings DB) + ngày làm việc + đơn giá (config.json)."""
+        shift_id = self._default_shift_combo.currentData()
+        if shift_id:
+            self._attendance.set_default_shift_id(shift_id)
+        self._config.attendance_workdays = [
+            i for i, cb in enumerate(self._workday_checks) if cb.isChecked()
+        ]
+        self._config.attendance_pay_rate = self._pay_rate_spin.value()
+        self._config.save()
+        logger.info(
+            "Đã lưu cài đặt chấm công: ca mặc định=%s, ngày làm việc=%s, đơn giá=%s",
+            shift_id,
+            self._config.attendance_workdays,
+            self._config.attendance_pay_rate,
+        )
+        QMessageBox.information(self, "Đã lưu", "Đã lưu ca mặc định + ngày làm việc.")
+
     def _on_reset_defaults(self) -> None:
         """Khôi phục mặc định: đưa các ô về giá trị khởi tạo (chưa lưu)."""
         defaults = Config()
@@ -830,6 +1166,8 @@ class SettingsView(QWidget):
         self._clahe_check.setChecked(defaults.clahe_enabled)
         self._smoothing_slider.setValue(defaults.smoothing_window)
         self._update_smoothing_label()
+        defaults_idle = self._idle_combo.findData(defaults.idle_lock_minutes)
+        self._idle_combo.setCurrentIndex(defaults_idle if defaults_idle >= 0 else 0)
         self._sync_check.blockSignals(True)
         self._sync_check.setChecked(defaults.sync_enabled)
         self._sync_check.blockSignals(False)
@@ -858,6 +1196,8 @@ class SettingsView(QWidget):
         self._config.anti_spoofing_enabled = self._spoof_check.isChecked()
         self._config.clahe_enabled = self._clahe_check.isChecked()
         self._config.smoothing_window = self._smoothing_slider.value()
+        # Tự khóa khi không dùng (FR-7) — data của combo là số phút (0 = tắt)
+        self._config.idle_lock_minutes = self._idle_combo.currentData() or 0
         self._config.sync_enabled = self._sync_check.isChecked()
         # Thông tin cloud (Bước 15) + R2 (Bước 16)
         self._config.cloud_account_id = self._account_edit.text().strip()
@@ -900,3 +1240,112 @@ class SettingsView(QWidget):
             self._cloud_thread.wait(1500)
             self._cloud_thread = None
             self._cloud_worker = None
+
+
+class ShiftDialog(QDialog):
+    """Hộp thoại thêm/sửa ca làm việc (attendance-spec FR-3).
+
+    ``shift=None`` → thêm mới; truyền Shift → điền sẵn giá trị cũ (sửa).
+    Validate HH:MM do ShiftRepository/AttendanceService đảm nhận — lỗi
+    ValueError hiển thị qua QMessageBox ở caller.
+    """
+
+    def __init__(self, parent=None, shift=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("THÊM CA" if shift is None else "SỬA CA")
+        self.setModal(True)
+        self.setFixedWidth(380)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._name_edit = QLineEdit(shift.name if shift else "")
+        self._name_edit.setPlaceholderText("VD: Hành chính, Ca đêm")
+        form.addRow("Tên ca:", self._name_edit)
+
+        self._start_edit = QLineEdit(shift.start_time if shift else "")
+        self._start_edit.setPlaceholderText("HH:MM (VD: 08:00)")
+        self._start_edit.setMaxLength(5)
+        form.addRow("Giờ vào:", self._start_edit)
+
+        self._end_edit = QLineEdit(shift.end_time if shift else "")
+        self._end_edit.setPlaceholderText("HH:MM (VD: 17:00; ca đêm 06:00)")
+        self._end_edit.setMaxLength(5)
+        form.addRow("Giờ ra:", self._end_edit)
+
+        self._grace_spin = QSpinBox()
+        self._grace_spin.setRange(0, 120)
+        self._grace_spin.setValue(shift.grace_minutes if shift else 10)
+        self._grace_spin.setSuffix(" phút")
+        self._grace_spin.setToolTip("Trễ trong khoảng này vẫn tính đúng giờ")
+        form.addRow("Dung sai trễ:", self._grace_spin)
+
+        # Hệ số lương ca (lương thô = số công × hệ số — schema v3)
+        self._factor_spin = QDoubleSpinBox()
+        self._factor_spin.setRange(0.1, 10.0)
+        self._factor_spin.setDecimals(2)
+        self._factor_spin.setSingleStep(0.25)
+        self._factor_spin.setValue(shift.factor if shift else 1.0)
+        self._factor_spin.setToolTip(
+            "Hệ số lương của ca — 1.0 ca thường, 1.5 ca tăng đơn. "
+            "Lương tháng = số công mỗi ca × hệ số ca đó."
+        )
+        form.addRow("Hệ số lương:", self._factor_spin)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "Ca đêm: giờ ra nhỏ hơn hoặc bằng giờ vào (VD 22:00 → 06:00). "
+            "Sự kiện sau nửa đêm vẫn tính về ngày bắt đầu ca."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 11px;")
+        layout.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Hủy")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Lưu")
+        save.setDefault(True)
+        save.clicked.connect(self._on_save)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def _on_save(self) -> None:
+        """Kiểm tra nhanh tên rỗng + định dạng giờ trước khi đóng."""
+        from app.infrastructure.repositories import _validate_hhmm
+
+        if not self._name_edit.text().strip():
+            QMessageBox.warning(self, "Thiếu thông tin", "Tên ca không được trống.")
+            return
+        for edit in (self._start_edit, self._end_edit):
+            try:
+                _validate_hhmm(edit.text())
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Sai định dạng",
+                    f"Giờ '{edit.text()}' không hợp lệ — cần dạng HH:MM (00:00–23:59).",
+                )
+                return
+        self.accept()
+
+    # Giá trị đọc sau khi dialog được chấp nhận
+    def name(self) -> str:
+        return self._name_edit.text().strip()
+
+    def start(self) -> str:
+        return self._start_edit.text().strip()
+
+    def end(self) -> str:
+        return self._end_edit.text().strip()
+
+    def grace(self) -> int:
+        return self._grace_spin.value()
+
+    def factor(self) -> float:
+        return self._factor_spin.value()

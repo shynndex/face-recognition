@@ -704,9 +704,9 @@ class EnrollmentDialog(QDialog):
         self._progress_bar.setTextVisible(True)
         self._progress_bar.setFormat("%p%")
         self._progress_bar.setStyleSheet(
-            "QProgressBar { border: 1px solid #555; border-radius: 4px; "
-            "text-align: center; height: 18px; } "
-            "QProgressBar::chunk { background-color: #2d7ff9; border-radius: 3px; }"
+            "QProgressBar { border: 1px solid #3a4049; border-radius: 4px; "
+            "text-align: center; height: 18px; background: #1a1d22; color: #e8ebf0; } "
+            "QProgressBar::chunk { background-color: #f59f00; border-radius: 3px; }"
         )
         layout.addWidget(self._progress_bar)
 
@@ -717,8 +717,8 @@ class EnrollmentDialog(QDialog):
         self._hint_label = QLabel("")
         self._hint_label.setWordWrap(True)
         self._hint_label.setStyleSheet(
-            "font-size: 13px; color: #888; padding: 4px 8px; "
-            "background: #1a1a2e; border-radius: 4px;"
+            "font-size: 13px; color: #ffbf3d; padding: 4px 8px; "
+            "background: #2a2313; border: 1px solid #6a5a30; border-radius: 4px;"
         )
         self._hint_label.setMinimumHeight(24)
         layout.addWidget(self._hint_label)

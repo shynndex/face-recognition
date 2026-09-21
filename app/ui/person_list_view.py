@@ -19,6 +19,7 @@ from typing import Callable
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.infrastructure.db import DATA_DIR, Database
+from app.services.attendance import AttendanceService
 from app.services.auth import AuthService
 from app.services.person import PersonService, PersonStats
 from app.ui.password_dialog import PasswordDialog
@@ -58,6 +60,10 @@ class PersonListView(QWidget):
         super().__init__(parent)
         self._auth = auth
         self._service = PersonService(db)
+        # Gán ca theo người (attendance-spec FR-3): combo từng dòng — đổi
+        # ngay, KHÔNG cần mật khẩu (không phải thay đổi dữ liệu nhận diện).
+        self._attendance = AttendanceService(db)
+        self._shifts: list = []
         self._enroll_callback = enroll_callback
         self._all_stats: list[PersonStats] = []
         self._build_ui()
@@ -128,6 +134,7 @@ class PersonListView(QWidget):
     def _refresh(self) -> None:
         """Đọc lại dữ liệu từ DB rồi vẽ lại danh sách."""
         self._all_stats = self._service.list_with_stats()
+        self._shifts = self._attendance.list_shifts()  # cho combo gán ca (FR-3)
         self._render()
 
     def _render(self) -> None:
@@ -197,6 +204,27 @@ class PersonListView(QWidget):
 
         row_layout.addLayout(info, stretch=1)
 
+        # Combo gán ca (attendance-spec FR-3): đổi → lưu ngay qua service
+        shift_combo = QComboBox()
+        shift_combo.setToolTip("Ca làm việc của người này (Mặc định = ca chung)")
+        default_index = 0
+        for i, shift in enumerate(self._shifts, start=1):
+            shift_combo.addItem(
+                f"{shift.name} ({shift.start_time}–{shift.end_time})", shift.id
+            )
+            if person.shift_id == shift.id:
+                default_index = i
+        shift_combo.addItem("Mặc định", None)
+        shift_combo.setCurrentIndex(
+            default_index if person.shift_id else shift_combo.count() - 1
+        )
+        shift_combo.currentIndexChanged.connect(
+            lambda _=False, pid=person.id, combo=shift_combo: self._on_shift_changed(
+                pid, combo
+            )
+        )
+        row_layout.addWidget(shift_combo)
+
         # Nút thao tác
         edit_btn = QPushButton("Sửa")
         edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -226,6 +254,20 @@ class PersonListView(QWidget):
     # ---------------------------------------------------------
     # Hành động
     # ---------------------------------------------------------
+    def _on_shift_changed(self, person_id: str, combo: QComboBox) -> None:
+        """Người dùng đổi combo ca → lưu ngay (không cần mật khẩu).
+
+        Ghi log; người đổi ngược ý chọn lại combo là xong (không giữ giá trị
+        cũ — thao tác nhẹ, tự chứng minh trên UI).
+        """
+        shift_id = combo.currentData()
+        ok = self._attendance.assign_shift(person_id, shift_id)
+        if not ok:
+            logger.warning("Gán ca thất bại cho người %s", person_id)
+            return
+        label = combo.currentText()
+        logger.info("Đã gán ca '%s' cho người %s", label, person_id)
+
     def _on_enroll(self) -> None:
         """Mở EnrollmentDialog (qua callback của MainWindow) rồi làm mới."""
         if self._enroll_callback is not None:

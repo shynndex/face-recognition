@@ -12,10 +12,11 @@ Kiến trúc: **local-first + outbox pattern** (ADR-4):
   ``*_r2_key``. Xóa dữ liệu → xóa luôn ảnh tương ứng. Kéo dữ liệu có key
   ảnh → tải ảnh về local để Lịch sử/Danh sách hiển thị. Storage chưa cấu
   hình → chỉ đồng bộ D1 (text).
-- PULL (cloud → local): kéo sự kiện từ cloud về (sau này app mobile ghi sự
-  kiện quét — desktop phải thấy trong Lịch sử). Người + embedding chỉ kéo
-  về khi local CHƯA có (khôi phục sau khi cài lại) — desktop là nơi QUẢN
-  LÝ nên local thắng khi trùng id.
+- PULL (cloud → local): kéo sự kiện + người + ca + ngày công từ cloud về
+  (app mobile ghi sự kiện quét — desktop phải thấy trong Lịch sử VÀ trong
+  bảng công). Người + embedding + ca + ngày công chỉ kéo về khi local CHƯA
+  có (khôi phục sau khi cài lại) — desktop là nơi QUẢN LÝ nên local thắng
+  khi trùng id.
 - Xung đột: mỗi dòng có id UUID riêng và sự kiện bất biến → "chèn nếu chưa
   có" là đủ an toàn cho quy mô <50 người (không cần cột updated_at phức tạp).
 
@@ -36,10 +37,14 @@ from app.config import Config
 from app.infrastructure.d1_client import D1Client, D1Error, blob_hex_literal
 from app.infrastructure.db import DATA_DIR, Database
 from app.infrastructure.s3_client import S3Client, S3Error
+from app.services.attendance import AttendanceService
 from app.infrastructure.repositories import (
+    AttendanceDay,
+    AttendanceDayRepository,
     FaceSampleRepository,
     PersonRepository,
     RecognitionEventRepository,
+    ShiftRepository,
     SyncOutboxRepository,
     _blob_to_embedding,
 )
@@ -80,11 +85,21 @@ class SyncService:
         self._persons = PersonRepository(db)
         self._samples = FaceSampleRepository(db)
         self._events = RecognitionEventRepository(db)
+        self._shifts = ShiftRepository(db)
+        self._att_days = AttendanceDayRepository(db)
         self._outbox = SyncOutboxRepository(db)
+        # Chấm công (attendance-spec FR-2): sự kiện MOBILE kéo về cập nhật
+        # ngày công — tạo MỘT lần, dùng cho mọi dòng pull.
+        self._attendance = AttendanceService(db)
 
     # ------------------------------------------------------------------
     # Đầu vào
     # ------------------------------------------------------------------
+    @property
+    def db(self) -> Database:
+        """Database service đang dùng (UI tái sử dụng cho service khác)."""
+        return self._db
+
     def is_configured(self) -> bool:
         """Đã có đủ 3 thông tin cloud chưa (account_id, database_id, token)?"""
         return bool(
@@ -172,6 +187,11 @@ class SyncService:
             for person in self._persons.list_all():
                 self._upload_person_thumbnail(storage, person)
                 statements.append(_person_upsert_stmt(person))
+            # Ca TRƯỚC ngày công (D1 có khóa ngoại attendance_days.shift_id)
+            for shift in self._shifts.list_all():
+                statements.append(_shift_upsert_stmt(shift))
+            for day in self._att_days.list_all():
+                statements.append(_attendance_day_upsert_stmt(day))
             for sample in self._samples.all_samples():
                 statements.append(_sample_upsert_stmt(sample))
             for event in self._events.list_all():
@@ -226,6 +246,18 @@ class SyncService:
                 return ("DELETE FROM face_samples WHERE id = ?", [entity_id])
             if sample is not None:
                 return _sample_upsert_stmt(sample)
+        elif entity == "shift":
+            if op == "delete":
+                return ("DELETE FROM shifts WHERE id = ?", [entity_id])
+            shift = self._shifts.get(entity_id)
+            if shift is not None:
+                return _shift_upsert_stmt(shift)
+        elif entity == "attendance_day":
+            if op == "delete":
+                return ("DELETE FROM attendance_days WHERE id = ?", [entity_id])
+            day = self._att_days.get(entity_id)
+            if day is not None:
+                return _attendance_day_upsert_stmt(day)
         elif entity == "recognition_event":
             event = self._events.get(entity_id)
             if op == "delete":
@@ -336,6 +368,65 @@ class SyncService:
             )
             result.pulled += 1
 
+        # 2b) Ca (attendance-spec FR-9) — TRƯỚC ngày công (FK shift_id)
+        for row in client.query(
+            "SELECT id, name, start_time, end_time, grace_minutes, factor, created_at"
+            " FROM shifts"
+        ):
+            if self._shifts.get(row["id"]) is not None:
+                continue  # desktop quản lý chính — local thắng (như persons)
+            try:
+                self._shifts.add(
+                    name=row["name"],
+                    start_time=row["start_time"],
+                    end_time=row["end_time"],
+                    grace_minutes=int(row.get("grace_minutes") or 10),
+                    factor=float(row.get("factor") or 1.0),
+                    shift_id=row["id"],
+                    created_at=row.get("created_at"),
+                    record_outbox=False,
+                )
+                result.pulled += 1
+            except ValueError as exc:
+                # Dữ liệu cloud hỏng (giờ sai) → bỏ ca này, không chết pull
+                logger.warning("Bỏ qua ca không hợp lệ từ cloud: %s", exc)
+
+        # 2c) Ngày công (attendance-spec FR-9) — chèn dòng local CHƯA có
+        for row in client.query(
+            "SELECT id, person_id, work_date, shift_id, check_in_at, check_out_at,"
+            " status, manual_override, note, updated_at FROM attendance_days"
+        ):
+            if self._att_days.find(row["person_id"], row["work_date"]) is not None:
+                continue
+            # person_id NOT NULL + FK → ngày công của người CHƯA có local
+            # phải BỎ (không thể ngắt liên kết như sự kiện — dòng sẽ vô nghĩa).
+            # Người sẽ được kéo về khi máy đó sync persons (pull chạy persons
+            # trước nên thường đã có); bỏ dòng này là an toàn nhất.
+            if self._persons.get(row["person_id"]) is None:
+                logger.warning(
+                    "Bỏ qua ngày công %s của người chưa có local (%s)",
+                    row["id"], row["person_id"],
+                )
+                continue
+            # Ca tham chiếu chưa có local → NULL (ngày công vẫn giữ, như sự kiện)
+            shift_id = row.get("shift_id")
+            if shift_id is not None and self._shifts.get(shift_id) is None:
+                shift_id = None
+            day = AttendanceDay(
+                id=row["id"],
+                person_id=row["person_id"],
+                work_date=row["work_date"],
+                shift_id=shift_id,
+                check_in_at=row.get("check_in_at"),
+                check_out_at=row.get("check_out_at"),
+                status=row.get("status") or "auto",
+                manual_override=bool(row.get("manual_override")),
+                note=row.get("note") or "",
+                updated_at=row.get("updated_at") or "",
+            )
+            self._att_days.add_external(day, record_outbox=False)
+            result.pulled += 1
+
         # 3) Sự kiện (cuối — sau persons để khóa ngoại person_id hợp lệ)
         for row in client.query(
             "SELECT id, person_id, label, source, detected_at, similarity,"
@@ -362,6 +453,11 @@ class SyncService:
                 snapshot_r2_key=r2_key,
                 record_outbox=False,
             )
+            # Chấm công (attendance-spec FR-2): sự kiện MOBILE kéo về cũng
+            # cập nhật ngày công — desktop tự ghép check-in/out. Chỉ sự kiện
+            # xác nhận (person_id còn nguyên, không phải người lạ).
+            if person_id is not None and not bool(row.get("is_unknown")):
+                self._attendance.on_event(person_id, row.get("detected_at"))
             result.pulled += 1
 
     # ------------------------------------------------------------------
@@ -431,15 +527,51 @@ def _bind(sql: str, params: list[str | None]) -> tuple[str, list[str]]:
 
 def _person_upsert_stmt(person: Any) -> tuple[str, list[str] | None]:
     sql = (
-        "INSERT INTO persons (id, name, created_at, thumbnail_path, thumbnail_r2_key)"
-        " VALUES (?, ?, ?, ?, ?)"
+        "INSERT INTO persons (id, name, created_at, thumbnail_path,"
+        " thumbnail_r2_key, shift_id)"
+        " VALUES (?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(id) DO UPDATE SET name = excluded.name,"
         " thumbnail_path = excluded.thumbnail_path,"
-        " thumbnail_r2_key = excluded.thumbnail_r2_key"
+        " thumbnail_r2_key = excluded.thumbnail_r2_key,"
+        " shift_id = excluded.shift_id"
     )
     return _bind(sql, [
         person.id, person.name, person.created_at,
-        person.thumbnail_path, person.thumbnail_r2_key,
+        person.thumbnail_path, person.thumbnail_r2_key, person.shift_id,
+    ])
+
+
+def _shift_upsert_stmt(shift: Any) -> tuple[str, list[str] | None]:
+    """Upsert ca làm việc lên D1 (attendance-spec FR-9; factor từ schema v3)."""
+    sql = (
+        "INSERT INTO shifts (id, name, start_time, end_time, grace_minutes, factor, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(id) DO UPDATE SET name = excluded.name,"
+        " start_time = excluded.start_time, end_time = excluded.end_time,"
+        " grace_minutes = excluded.grace_minutes, factor = excluded.factor"
+    )
+    return _bind(sql, [
+        shift.id, shift.name, shift.start_time, shift.end_time,
+        str(shift.grace_minutes), repr(float(shift.factor)), shift.created_at or None,
+    ])
+
+
+def _attendance_day_upsert_stmt(day: Any) -> tuple[str, list[str] | None]:
+    """Upsert ngày công lên D1 (attendance-spec FR-9)."""
+    sql = (
+        "INSERT INTO attendance_days (id, person_id, work_date, shift_id,"
+        " check_in_at, check_out_at, status, manual_override, note, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(id) DO UPDATE SET check_in_at = excluded.check_in_at,"
+        " check_out_at = excluded.check_out_at, status = excluded.status,"
+        " manual_override = excluded.manual_override, note = excluded.note,"
+        " updated_at = excluded.updated_at"
+    )
+    return _bind(sql, [
+        day.id, day.person_id, day.work_date, day.shift_id,
+        day.check_in_at, day.check_out_at, day.status,
+        "1" if day.manual_override else "0", day.note,
+        day.updated_at or None,
     ])
 
 

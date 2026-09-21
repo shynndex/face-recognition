@@ -368,8 +368,16 @@ def test_pull_downloads_images() -> None:
     check("key R2 được lưu local (không upload lại sau này)",
           person.thumbnail_r2_key == "thumbnails/p-cloud-2.jpg"
           and event.snapshot_r2_key == "snapshots/ev-mobile-2.jpg")
-    check("kéo KHÔNG ghi outbox (không vòng lặp)",
-          SyncOutboxRepository(db).count_pending() == 0)
+    # FR-2+FR-9: pull sự kiện mobile còn SUY RA ngày công mới ở local →
+    # dòng 'attendance_day' ĐÚNG LẮM được ghi outbox (đẩy lên cloud lần
+    # sau — mobile không tự tính ngày công). Chỉ dữ liệu GỐC (person/
+    # face_sample/recognition_event) không được ghi outbox (vòng lặp).
+    pending_entities = {
+        entity for _oid, entity, _eid, _op in SyncOutboxRepository(db).list_pending()
+    }
+    check("kéo KHÔNG ghi outbox cho dữ liệu gốc (không vòng lặp)",
+          not (pending_entities & {"person", "face_sample", "recognition_event"}),
+          f"(entities={pending_entities or '∅'})")
 
 
 # ---------------------------------------------------------------------------

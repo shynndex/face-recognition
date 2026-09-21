@@ -9,8 +9,9 @@ Cấu trúc: QMainWindow chứa QStackedWidget với 2 tầng:
 from __future__ import annotations
 
 import logging
+import time
 
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QEvent, QThread, Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,7 +30,9 @@ from app.config import Config
 from app.infrastructure.db import Database
 from app.services.auth import AuthService
 from app.services.sync import SyncService
+from app.ui.attendance_view import AttendanceView
 from app.ui.camera_view import CameraView
+from app.ui.dashboard_view import DashboardView
 from app.ui.enrollment_dialog import EnrollmentDialog
 from app.ui.history_view import HistoryView
 from app.ui.lock_screen import LockScreen
@@ -39,17 +42,26 @@ from app.ui.settings_view import SettingsView
 
 logger = logging.getLogger(__name__)
 
-# Danh sách màn hình: (tiêu đề hiển thị trên sidebar, tên trang)
+# Danh sách màn hình: (tên hiển thị trên sidebar, tên trang)
+# Phong cách Security Console: mục nav đánh số kiểu console, không dùng emoji.
+# Dashboard đặt ĐẦU tiên — mở app/mở khóa là thấy tổng quan chấm công hôm nay.
 PAGES: list[tuple[str, str]] = [
-    ("📹  Nhận diện", "CameraView"),
-    ("🖼️  Nhận diện ảnh", "PhotoView"),
-    ("➕  Đăng ký mới", "EnrollmentDialog"),
-    ("👤  Danh sách người", "PersonListView"),
-    ("📋  Lịch sử", "HistoryView"),
-    ("⚙️  Cài đặt", "SettingsView"),
+    ("Tổng quan", "DashboardView"),
+    ("Nhận diện", "CameraView"),
+    ("Nhận diện ảnh", "PhotoView"),
+    ("Đăng ký mới", "EnrollmentDialog"),
+    ("Danh sách người", "PersonListView"),
+    ("Lịch sử", "HistoryView"),
+    ("Chấm công", "AttendanceView"),
+    ("Cài đặt", "SettingsView"),
 ]
-# Icon-only version for collapsed sidebar (emoji chi, khong text)
-_ICONS: list[str] = ["📹", "🖼️", "➕", "👤", "📋", "⚙️"]
+# Nhãn rút gọn khi sidebar thu gọn (số thứ tự kiểu console)
+_ICONS: list[str] = ["01", "02", "03", "04", "05", "06", "07", "08"]
+
+
+def _nav_label(title: str, index: int) -> str:
+    """Nhãn sidebar mở rộng: '01  Nhận diện' — đánh số mono kiểu console."""
+    return f"{index + 1:02d}  {title}"
 # Ngưỡng chiều rộng (px) — dưới mức này sidebar thu gọn chỉ còn icon
 _SIDEBAR_COLLAPSE_WIDTH = 700
 _SIDEBAR_EXPANDED_WIDTH = 200
@@ -81,6 +93,18 @@ class MainWindow(QMainWindow):
         self._root.addWidget(self._content)
         self.setCentralWidget(self._root)
 
+        # Tự khóa khi không dùng (FR-7): QTimer một lần đọc lại idle_lock_minutes
+        # mỗi giây; chỉ phím/chuột TRONG cửa sổ reset bộ đếm (đã chốt: camera
+        # chạy không reset; khi đang ở LockScreen thì không đếm). 0 = tắt.
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(1000)
+        self._idle_timer.timeout.connect(self._check_idle_lock)
+        self._last_activity = time.monotonic()
+        self._idle_timer.start()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
         self._lock_screen.unlocked.connect(
             lambda: self._root.setCurrentWidget(self._content)
         )
@@ -103,6 +127,50 @@ class MainWindow(QMainWindow):
         logger.info("Khởi tạo cửa sổ chính hoàn tất (%d màn hình)", len(PAGES))
 
     # ---------------------------------------------------------
+    # Tự khóa khi không dùng (FR-7 — spec quản lý mật khẩu)
+    # ---------------------------------------------------------
+
+    def eventFilter(self, obj, event):  # noqa: N802 (chuẩn Qt)
+        """Bắt phím/chuột trong cửa sổ chính → reset bộ đếm idle (FR-7).
+
+        Chỉ lắng nghe các sự kiện tương tác được chốt (phím, chuột, cuộn,
+        cảm ứng); di chuột ĐƠN THUẶN (Hover) không reset. Khi đang hiển thị
+        LockScreen thì không đếm nữa (đã khóa rồi).
+        """
+        if event.type() in (
+            QEvent.Type.KeyPress,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.Wheel,
+            QEvent.Type.TouchUpdate,
+            QEvent.Type.TouchBegin,
+        ):
+            self._last_activity = time.monotonic()
+        return super().eventFilter(obj, event)
+
+    def _check_idle_lock(self) -> None:
+        """Hết giờ: quá idle_lock_minutes không tương tác → tự khóa (FR-7).
+
+        Đọc config MỖI giây (rẻ) nên đổi tùy chọn ở Cài đặt có hiệu lực
+        ngay mà không cần khởi động lại. 0 = tắt; đang ở LockScreen hoặc
+        cửa sổ ẩn (đã thu nhỏ) thì không đếm.
+        """
+        minutes = self._config.idle_lock_minutes or 0
+        if minutes <= 0:
+            return
+        if self._root.currentWidget() is not self._content:
+            return  # đang ở màn hình khóa — không đếm (đã chốt)
+        if not self.isVisible():
+            return  # cửa sổ ẩn (thu nhỏ) — không khóa ngầm
+        idle_seconds = time.monotonic() - self._last_activity
+        if idle_seconds >= minutes * 60:
+            logger.info(
+                "Tự khóa sau %d phút không tương tác (FR-7)", minutes
+            )
+            self._lock_now()
+
+    # ---------------------------------------------------------
     # Vùng nội dung (sidebar + các trang)
     # ---------------------------------------------------------
 
@@ -117,23 +185,28 @@ class MainWindow(QMainWindow):
         left = QVBoxLayout()
         left.setSpacing(0)
 
+        # Nhãn thương hiệu kiểu console trên đỉnh sidebar (ẩn khi thu gọn)
+        self._brand_label = QLabel("FACE·ID // CONSOLE")
+        self._brand_label.setObjectName("sectionTitle")
+        self._brand_label.setStyleSheet("font-size: 14px; padding: 4px 2px 10px 2px;")
+
         self.nav = QListWidget()
         self.nav.setObjectName("navList")
         self.nav.setFixedWidth(_SIDEBAR_EXPANDED_WIDTH)
-        for title, _ in PAGES:
-            item = QListWidgetItem(title)
-            item.setToolTip(title.strip())  # hiển thị khi sidebar thu gọn
+        for i, (title, _) in enumerate(PAGES):
+            item = QListWidgetItem(_nav_label(title, i))
+            item.setToolTip(title)  # hiển thị khi sidebar thu gọn
             self.nav.addItem(item)
         self.nav.currentRowChanged.connect(self._switch_page)
 
-        self._lock_btn = QPushButton("🔒 Khoá")
+        self._lock_btn = QPushButton("KHOÁ")
         self._lock_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lock_btn.setObjectName("sidebarBtn")
         self._lock_btn.setToolTip("Khoá ứng dụng (Ctrl+L)")
         self._lock_btn.clicked.connect(self._lock_now)
 
         # Nút S/T — chuyển đổi Dark/Light theme (FR-9, wireframe [S/T])
-        self._theme_btn = QPushButton("☀️")
+        self._theme_btn = QPushButton("SÁNG")
         self._theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._theme_btn.setObjectName("sidebarBtn")
         self._theme_btn.setToolTip("Chuyển đổi chủ đề Sáng / Tối")
@@ -145,6 +218,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self._lock_btn, stretch=1)
         btn_row.addWidget(self._theme_btn)
 
+        left.addWidget(self._brand_label)
         left.addWidget(self.nav)
         left.addLayout(btn_row)
 
@@ -163,6 +237,14 @@ class MainWindow(QMainWindow):
             detector=self._camera_view.detector,
         )
         self._history_view = HistoryView(self._db, self._auth)
+        self._attendance_view = AttendanceView(
+            self._db, self._auth, config=self._config
+        )
+        self._dashboard_view = DashboardView(self._db, config=self._config)
+        # Dashboard → nút [ Bảng công tháng ] mở trang Chấm công
+        self._dashboard_view.attendance_requested.connect(
+            lambda: self._open_page("AttendanceView")
+        )
         self._sync_service = SyncService(self._db, self._config)
         self._settings_view = SettingsView(self._config, self._auth, self._sync_service)
         self._settings_view.settings_saved.connect(self._on_settings_saved)
@@ -178,6 +260,10 @@ class MainWindow(QMainWindow):
                 page = self._photo_view
             elif name == "HistoryView":
                 page = self._history_view
+            elif name == "AttendanceView":
+                page = self._attendance_view
+            elif name == "DashboardView":
+                page = self._dashboard_view
             elif name == "SettingsView":
                 page = self._settings_view
             else:
@@ -282,6 +368,14 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(index)
             logger.debug("Chuyển đến màn hình: %s", PAGES[index][0])
 
+    def _open_page(self, page_name: str) -> None:
+        """Mở trang theo tên PAGES (dùng cho tín hiệu giữa các trang)."""
+        for index, (_, name) in enumerate(PAGES):
+            if name == page_name:
+                self.nav.setCurrentRow(index)  # _switch_page tự chạy theo
+                return
+        logger.warning("Không tìm thấy trang: %s", page_name)
+
     def _toggle_theme(self) -> None:
         """Chuyển đổi Dark/Light theme (FR-9) — áp ngay + lưu vào config.json."""
         from PySide6.QtWidgets import QApplication
@@ -297,9 +391,7 @@ class MainWindow(QMainWindow):
 
     def _update_theme_btn(self) -> None:
         """Nhãn nút S/T: hiển thị theme sẽ chuyển tới (ngược với theme hiện tại)."""
-        self._theme_btn.setText(
-            "🌙 Tối" if self._config.theme == "light" else "☀️ Sáng"
-        )
+        self._theme_btn.setText("TỐI" if self._config.theme == "light" else "SÁNG")
 
     def _maybe_auto_sync(self) -> None:
         """Tự đồng bộ khi mở khóa nếu đã bật cloud + đủ thông tin (Bước 15)."""
@@ -350,13 +442,13 @@ class MainWindow(QMainWindow):
     # Responsive sidebar — tự thu gọn khi cửa sổ nhỏ
     # ---------------------------------------------------------
     def _update_sidebar_mode(self) -> None:
-        """Thu gọn sidebar (icon only) khi cửa sổ nhỏ, mở rộng khi to.
+        """Thu gọn sidebar (chỉ số thứ tự) khi cửa sổ nhỏ, mở rộng khi to.
 
         Ngưỡng: _SIDEBAR_COLLAPSE_WIDTH (700px). Khi thu gọn:
-          - nav chỉ hiển thị emoji icon (không chữ)
-          - nút Khoá / theme thu nhỏ lại
+          - nav chỉ hiển thị số thứ tự kiểu console (01…06)
+          - nút Khoá / theme rút gọn chữ, ẩn nhãn thương hiệu
         Khi mở rộng:
-          - nav hiển thị đầy đủ icon + chữ
+          - nav hiển thị '01  Tên màn hình'
           - nút về kích thước bình thường
         """
         w = self.width()
@@ -366,17 +458,21 @@ class MainWindow(QMainWindow):
         self._sidebar_collapsed = collapsed
         if collapsed:
             self.nav.setFixedWidth(_SIDEBAR_COLLAPSED_WIDTH)
-            for i, icon in enumerate(_ICONS):
+            for i, short in enumerate(_ICONS):
                 if i < self.nav.count():
-                    self.nav.item(i).setText(icon)
-            self._lock_btn.setText("🔒")
-            self._theme_btn.setText("☀️" if self._config.theme == "light" else "🌙")
+                    self.nav.item(i).setText(short)
+            self._brand_label.setVisible(False)
+            self._lock_btn.setText("KHOÁ")
+            self._theme_btn.setText(
+                "TỐI" if self._config.theme == "light" else "SÁNG"
+            )
         else:
             self.nav.setFixedWidth(_SIDEBAR_EXPANDED_WIDTH)
             for i, (title, _) in enumerate(PAGES):
                 if i < self.nav.count():
-                    self.nav.item(i).setText(title)
-            self._lock_btn.setText("🔒 Khoá")
+                    self.nav.item(i).setText(_nav_label(title, i))
+            self._brand_label.setVisible(True)
+            self._lock_btn.setText("KHOÁ")
             self._update_theme_btn()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (chuẩn Qt)
@@ -388,6 +484,10 @@ class MainWindow(QMainWindow):
         """Đóng app: dừng camera + thread đồng bộ và giải phóng tài nguyên."""
         self._camera_view.stop_camera()
         self._settings_view.stop_probe()
+        self._idle_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         auto = getattr(self, "_auto_sync_thread", None)
         if auto is not None and auto.isRunning():
             auto.quit()

@@ -66,6 +66,20 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 def cleanup() -> None:
     TEMP_CONFIG.unlink(missing_ok=True)
+    # SettingsView giờ tự mở DB qua AttendanceService (chấm công) — các
+    # Database TẠM vẫn giữ kết nối mở; Windows không cho xóa file đang mở
+    # → dùng garbage-collect + đóng kết nối sqlite còn sống trước khi xóa.
+    import gc
+
+    gc.collect()
+    import sqlite3
+
+    for obj in gc.get_objects():
+        if isinstance(obj, sqlite3.Connection):
+            try:
+                obj.close()
+            except sqlite3.Error:
+                pass
     for suffix in ("", "-wal", "-shm"):  # SQLite WAL tạo thêm 2 file kèm
         Path(str(TEMP_DB) + suffix).unlink(missing_ok=True)
 

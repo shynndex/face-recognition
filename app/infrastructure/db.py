@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "app.db"
 
-SCHEMA_VERSION = 1  # tăng khi có thay đổi cấu trúc bảng (PRAGMA user_version)
+SCHEMA_VERSION = 4  # tăng khi có thay đổi cấu trúc bảng (PRAGMA user_version)
 
 # Khóa toàn cục tuần tự hóa giao dịch SQLite giữa các THREAD (Bước 15).
 # SyncService chạy trong QThread (không đơ UI) nhưng dùng chung connection
@@ -35,17 +35,33 @@ SCHEMA_VERSION = 1  # tăng khi có thay đổi cấu trúc bảng (PRAGMA user_
 _DB_LOCK = threading.RLock()
 
 
+# Định nghĩa sync_outbox tách riêng — SCHEMA_SQL dùng khi tạo DB mới,
+# _migrate_v1_to_v2 dùng khi dựng LẠI bảng cho DB cũ v1 (CHECK entity cũ
+# không chứa 'shift'/'attendance_day' → ghi outbox chấm công sẽ crash).
+SYNC_OUTBOX_DDL = """
+CREATE TABLE IF NOT EXISTS sync_outbox (
+    id         TEXT PRIMARY KEY,        -- UUID v4
+    entity     TEXT NOT NULL CHECK (entity IN ('person', 'face_sample', 'recognition_event', 'shift', 'attendance_day')),
+    entity_id  TEXT NOT NULL,
+    op         TEXT NOT NULL CHECK (op IN ('upsert', 'delete')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    synced_at  TEXT                     -- NULL = chưa đồng bộ
+)
+"""
+
+
 # -------------------------------------------------------------
 # Lược đồ CSDL — giữ NGUYÊN cú pháp như spec 5.4 (dùng chung D1)
 # -------------------------------------------------------------
-SCHEMA_SQL = """
+SCHEMA_SQL = f"""
 -- 1) persons — người đã đăng ký khuôn mặt
 CREATE TABLE IF NOT EXISTS persons (
     id               TEXT PRIMARY KEY,  -- UUID v4 (hex) — KHÔNG dùng AUTOINCREMENT
     name             TEXT NOT NULL CHECK (length(trim(name)) > 0),
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     thumbnail_path   TEXT NOT NULL,     -- đường dẫn ảnh đại diện (local)
-    thumbnail_r2_key TEXT               -- NULL = chưa upload lên R2
+    thumbnail_r2_key TEXT,               -- NULL = chưa upload lên R2
+    shift_id         TEXT REFERENCES shifts(id) ON DELETE SET NULL -- NULL = ca mặc định
 );
 
 -- 2) face_samples — các mẫu embedding (3–5 mẫu/người)
@@ -75,14 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_events_person      ON recognition_events(person_i
 CREATE INDEX IF NOT EXISTS idx_events_source      ON recognition_events(source);
 
 -- 4) sync_outbox — hàng đợi đồng bộ cloud (outbox pattern, dùng ở Bước 15)
-CREATE TABLE IF NOT EXISTS sync_outbox (
-    id         TEXT PRIMARY KEY,        -- UUID v4
-    entity     TEXT NOT NULL CHECK (entity IN ('person', 'face_sample', 'recognition_event')),
-    entity_id  TEXT NOT NULL,
-    op         TEXT NOT NULL CHECK (op IN ('upsert', 'delete')),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    synced_at  TEXT                     -- NULL = chưa đồng bộ
-);
+{SYNC_OUTBOX_DDL};
 -- Partial index: chỉ quét hàng chưa đồng bộ — nhanh cho SyncService
 CREATE INDEX IF NOT EXISTS idx_outbox_pending
     ON sync_outbox(synced_at) WHERE synced_at IS NULL;
@@ -92,6 +101,51 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- 6) shifts — ca làm việc (attendance-spec FR-3): giờ quy định + dung sai trễ
+CREATE TABLE IF NOT EXISTS shifts (
+    id            TEXT PRIMARY KEY,      -- UUID v4 (hex)
+    name          TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    start_time    TEXT NOT NULL,         -- 'HH:MM' giờ ĐỊA PHƯƠNG
+    end_time      TEXT NOT NULL,         -- 'HH:MM' — <= start_time = ca đêm (qua nửa đêm)
+    factor        REAL NOT NULL DEFAULT 1.0 CHECK (factor > 0),  -- hệ số lương ca (lương thô)
+    break_start   TEXT,                  -- 'HH:MM' đầu nghỉ giữa ca (NULL = không nghỉ cố định)
+    break_end     TEXT,                  -- 'HH:MM' hết nghỉ — <= break_start = nghỉ qua nửa đêm
+    grace_minutes INTEGER NOT NULL DEFAULT 10 CHECK (grace_minutes >= 0),
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 7) attendance_days — bản ghi ngày công (1 dòng / người / ngày — FR-1)
+CREATE TABLE IF NOT EXISTS attendance_days (
+    id              TEXT PRIMARY KEY,    -- UUID v4 (hex)
+    person_id       TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+    work_date       TEXT NOT NULL,       -- 'YYYY-MM-DD' theo NGÀY BẮT ĐẦU CA (giờ địa phương)
+    shift_id        TEXT REFERENCES shifts(id) ON DELETE SET NULL, -- ca áp dụng lúc tính
+    check_in_at     TEXT,                -- ISO UTC; NULL = chưa có giờ vào
+    check_out_at    TEXT,                -- ISO UTC; NULL = thiếu giờ ra
+    status          TEXT NOT NULL DEFAULT 'auto'
+                    CHECK (status IN ('auto', 'leave', 'trip', 'manual')),
+    manual_override INTEGER NOT NULL DEFAULT 0 CHECK (manual_override IN (0, 1)),
+    note            TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (person_id, work_date)        -- chống trùng dòng công cùng ngày
+);
+CREATE INDEX IF NOT EXISTS idx_attendance_person_date
+    ON attendance_days(person_id, work_date DESC);
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_days(work_date);
+
+-- 8) attendance_audit — lịch sử sửa tay bản ghi công (FR-5; KHÔNG sync D1)
+CREATE TABLE IF NOT EXISTS attendance_audit (
+    id                 TEXT PRIMARY KEY, -- UUID v4 (hex)
+    attendance_day_id  TEXT NOT NULL REFERENCES attendance_days(id) ON DELETE CASCADE,
+    action             TEXT NOT NULL CHECK (action IN ('edit_time', 'set_status', 'add_note')),
+    old_value          TEXT NOT NULL DEFAULT '',
+    new_value          TEXT NOT NULL DEFAULT '',
+    edited_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    detail             TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_attendance_audit_day
+    ON attendance_audit(attendance_day_id, edited_at DESC);
 """
 
 
@@ -138,9 +192,92 @@ class Database:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version < SCHEMA_VERSION:
             self._conn.executescript(SCHEMA_SQL)
+            if version < 2:
+                self._migrate_v1_to_v2()
+            if version < 3:
+                self._migrate_v2_to_v3()
+            if version < 4:
+                self._migrate_v3_to_v4()
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
             logger.info("Đã khởi tạo CSDL schema v%d tại %s", SCHEMA_VERSION, self._path)
+
+    def _migrate_v1_to_v2(self) -> None:
+        """Nâng cấp DB v1 → v2 (chấm công — attendance-spec FR-1).
+
+        DB v1 có 2 điểm không tương thích với schema mới:
+          1. ``persons`` thiếu cột ``shift_id`` → ALTER TABLE ADD COLUMN.
+          2. ``sync_outbox`` có CHECK entity cũ (không chứa 'shift' /
+             'attendance_day') → dựng lại bảng, giữ nguyên dữ liệu outbox
+             đang chờ đồng bộ (SQLite không sửa được CHECK nên phải rebuild).
+        Các bảng MỚI (shifts/attendance_days/attendance_audit) đã được
+        executescript(SCHEMA_SQL) tạo ở trên nhờ IF NOT EXISTS.
+        """
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(persons)").fetchall()
+        }
+        if "shift_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE persons ADD COLUMN shift_id TEXT"
+                " REFERENCES shifts(id) ON DELETE SET NULL"
+            )
+            logger.info("Migration v1→v2: đã thêm cột persons.shift_id")
+
+        # Rebuild sync_outbox (CHECK mới). DROP INDEX trước — index gắn bảng cũ.
+        self._conn.execute("DROP INDEX IF EXISTS idx_outbox_pending")
+        self._conn.execute("ALTER TABLE sync_outbox RENAME TO sync_outbox_v1_old")
+        self._conn.executescript(SYNC_OUTBOX_DDL)
+        self._conn.execute(
+            "INSERT INTO sync_outbox (id, entity, entity_id, op, created_at, synced_at)"
+            " SELECT id, entity, entity_id, op, created_at, synced_at"
+            " FROM sync_outbox_v1_old"
+        )
+        self._conn.execute("DROP TABLE sync_outbox_v1_old")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_pending"
+            " ON sync_outbox(synced_at) WHERE synced_at IS NULL"
+        )
+        logger.info("Migration v1→v2: đã dựng lại sync_outbox với entity chấm công")
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Nâng cấp DB v2 → v3 (lương thô — hệ số ca theo attendance-spec FR-3).
+
+        Thêm cột ``shifts.factor`` (REAL DEFAULT 1.0) — ca mới 1.0 trừ khi
+        chỉnh tay; ngày công giữ ``shift_id`` của lúc tính nên tổng lương
+        tháng không đổi khi sửa ca sau này (đúng nguyên tắc spec: ngày đã
+        ghi giữ nguyên shift_id đã dùng).
+        """
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(shifts)").fetchall()
+        }
+        if "factor" not in cols:
+            self._conn.execute(
+                "ALTER TABLE shifts ADD COLUMN factor REAL NOT NULL DEFAULT 1.0"
+                " CHECK (factor > 0)"
+            )
+            logger.info("Migration v2→v3: đã thêm cột shifts.factor")
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Nâng cấp DB v3 → v4 (nghỉ giữa ca theo attendance-spec FR-3/FR-4).
+
+        Thêm 2 cột ``shifts.break_start`` / ``shifts.break_end`` ('HH:MM'
+        địa phương, NULL = ca không có khoảng nghỉ cố định). Ca cũ giữ
+        nguyên hành vi (không trừ gì) — chỉ ca mới cấu hình nghỉ mới trừ.
+        """
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(shifts)").fetchall()
+        }
+        if "break_start" not in cols:
+            self._conn.execute(
+                "ALTER TABLE shifts ADD COLUMN break_start TEXT"
+            )
+            self._conn.execute(
+                "ALTER TABLE shifts ADD COLUMN break_end TEXT"
+            )
+            logger.info("Migration v3→v4: đã thêm cột shifts.break_start/break_end")
 
     @contextmanager
     def session(self) -> Iterator[sqlite3.Connection]:

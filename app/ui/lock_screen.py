@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.ui.widgets import PasswordEdit
 from app.services.auth import (
     REQUIREMENTS_TEXT,
     SOFT_LOCK_AFTER,
@@ -74,12 +75,19 @@ class LockScreen(QWidget):
 
         title = QLabel("NHẬN DIỆN KHUÔN MẶT")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size: 28px; font-weight: bold; letter-spacing: 2px;")
+        # Security Console: tiêu đề mono, giãn ký tự; màu nhấn do theme quyết định
+        title.setObjectName("headerLabel")
+        title.setStyleSheet(
+            "font-size: 24px; letter-spacing: 6px; padding: 6px;"
+        )
         outer.addWidget(title)
 
         self._subtitle = QLabel()
         self._subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._subtitle.setStyleSheet("font-size: 14px;")
+        self._subtitle.setStyleSheet(
+            "font-family: Consolas, 'Cascadia Mono', 'Courier New', monospace;"
+            "font-size: 13px; letter-spacing: 2px;"
+        )
         outer.addWidget(self._subtitle)
         outer.addSpacing(24)
 
@@ -87,29 +95,24 @@ class LockScreen(QWidget):
         card = QFrame()
         card.setFixedWidth(420)
         card.setObjectName("card")
-        card.setStyleSheet("border-radius: 10px;")
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(24, 24, 24, 24)
         card_layout.setSpacing(10)
 
-        # ---- Vùng mật khẩu (ô 1 + ô 2 + eye toggle) ----
-        self._pw1 = QLineEdit()
-        self._pw1.setEchoMode(QLineEdit.EchoMode.Password)
+        # ---- Vùng mật khẩu (PasswordEdit = ô nhập + icon mắt trong ô) ----
+        self._pw1 = PasswordEdit()
         self._pw1.returnPressed.connect(self._on_submit)
         card_layout.addWidget(self._pw1)
 
-        self._pw2 = QLineEdit()
-        self._pw2.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw2 = PasswordEdit()
         self._pw2.setPlaceholderText("Nhập lại mật khẩu")
         self._pw2.returnPressed.connect(self._on_submit)
         card_layout.addWidget(self._pw2)
 
-        self._eye_btn = self._make_eye_button(self._pw1, self._pw2)
-        card_layout.addWidget(self._eye_btn, alignment=Qt.AlignmentFlag.AlignRight)
-
         # ---- Vùng câu hỏi bảo mật ----
         self._sec_title = QLabel()
-        self._sec_title.setStyleSheet("font-size: 13px; font-weight: bold; margin-top: 6px;")
+        self._sec_title.setObjectName("headerLabel")
+        self._sec_title.setStyleSheet("font-size: 12px; margin-top: 6px;")
         card_layout.addWidget(self._sec_title)
 
         self._q1_edit = QLineEdit()
@@ -131,32 +134,32 @@ class LockScreen(QWidget):
         # ---- Nút chính / link phụ ----
         self._back_btn = QPushButton("‹ Quay lại mở khóa")
         self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._back_btn.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; }")
+        self._back_btn.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; } QPushButton:hover { color: #f59f00; }")
         self._back_btn.clicked.connect(self._on_back)
         card_layout.addWidget(self._back_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self._submit_btn = QPushButton()
         self._submit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._submit_btn.setObjectName("primaryBtn")
-        self._submit_btn.setStyleSheet("border-radius: 6px; padding: 10px; font-size: 14px;")
+        self._submit_btn.setStyleSheet("border-radius: 4px; padding: 10px; font-size: 14px;")
         self._submit_btn.clicked.connect(self._on_submit)
         card_layout.addWidget(self._submit_btn)
 
         self._forgot_btn = QPushButton("Quên mật khẩu?")
         self._forgot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._forgot_btn.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; }")
+        self._forgot_btn.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; } QPushButton:hover { color: #f59f00; }")
         self._forgot_btn.clicked.connect(self._on_forgot)
         card_layout.addWidget(self._forgot_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self._error_label = QLabel()
         self._error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._error_label.setStyleSheet("color: #d33; font-weight: bold;")
+        self._error_label.setStyleSheet("color: #ff7b72; font-weight: bold;")
         self._error_label.setWordWrap(True)
         card_layout.addWidget(self._error_label)
 
         self._lockout_label = QLabel()
         self._lockout_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lockout_label.setStyleSheet("color: #d33; font-weight: bold;")
+        self._lockout_label.setStyleSheet("color: #ff7b72; font-weight: bold; font-family: Consolas, 'Cascadia Mono', 'Courier New', monospace;")
         card_layout.addWidget(self._lockout_label)
 
         center = QHBoxLayout()
@@ -167,27 +170,10 @@ class LockScreen(QWidget):
 
         self._hint = QLabel()
         self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hint.setStyleSheet("font-size: 12px; color: #888;")
+        self._hint.setStyleSheet("font-size: 12px; color: #888; font-family: Consolas, 'Cascadia Mono', 'Courier New', monospace;")
         self._hint.setWordWrap(True)
         outer.addWidget(self._hint)
         outer.addStretch(3)
-
-    @staticmethod
-    def _make_eye_button(*edits: QLineEdit) -> QPushButton:
-        """Nút 👁 bật/tắt hiện mật khẩu cho các ô được gắn (FR-4)."""
-
-        def toggle() -> None:
-            show = edits[0].echoMode() == QLineEdit.EchoMode.Password
-            mode = QLineEdit.EchoMode.Normal if show else QLineEdit.EchoMode.Password
-            for edit in edits:
-                edit.setEchoMode(mode)
-            btn.setText("🙈 Ẩn" if show else "👁 Hiện")
-
-        btn = QPushButton("👁 Hiện")
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet("QPushButton { border: none; color: #888; font-size: 12px; }")
-        btn.clicked.connect(toggle)
-        return btn
 
     # ---------------------------------------------------------
     # Chế độ
@@ -268,7 +254,6 @@ class LockScreen(QWidget):
         # Nhóm trường: nhập lại mật khẩu chỉ cần ở chế độ tạo mới
         self._pw1.setVisible(mode != MODE_UPGRADE_QUESTIONS)
         self._pw2.setVisible(setup_pw)
-        self._eye_btn.setVisible(mode != MODE_UPGRADE_QUESTIONS)
         self._sec_title.setVisible(questions_form)
         self._q1_edit.setVisible(questions_form)
         self._a1_edit.setVisible(questions_form)
@@ -280,9 +265,8 @@ class LockScreen(QWidget):
         )
         self._back_btn.setVisible(mode == MODE_RECOVERY)
 
-        self._pw1.setEchoMode(QLineEdit.EchoMode.Password)
-        self._pw2.setEchoMode(QLineEdit.EchoMode.Password)
-        self._eye_btn.setText("👁 Hiện")
+        self._pw1.reset_echo()
+        self._pw2.reset_echo()
 
     def reset(self) -> None:
         """Xóa trường nhập + đồng bộ chế độ (gọi mỗi khi quay lại màn hình khóa)."""

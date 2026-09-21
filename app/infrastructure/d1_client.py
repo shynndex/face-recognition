@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS persons (
     name             TEXT NOT NULL CHECK (length(trim(name)) > 0),
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     thumbnail_path   TEXT NOT NULL,
-    thumbnail_r2_key TEXT
+    thumbnail_r2_key TEXT,
+    shift_id         TEXT REFERENCES shifts(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS face_samples (
@@ -80,6 +81,36 @@ CREATE TABLE IF NOT EXISTS recognition_events (
 CREATE INDEX IF NOT EXISTS idx_events_detected_at ON recognition_events(detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_person      ON recognition_events(person_id);
 CREATE INDEX IF NOT EXISTS idx_events_source      ON recognition_events(source);
+
+CREATE TABLE IF NOT EXISTS shifts (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    start_time    TEXT NOT NULL,
+    end_time      TEXT NOT NULL,
+    factor        REAL NOT NULL DEFAULT 1.0 CHECK (factor > 0),  -- hệ số lương ca (lương thô)
+    break_start   TEXT,                  -- 'HH:MM' đầu nghỉ giữa ca (NULL = không nghỉ cố định)
+    break_end     TEXT,                  -- 'HH:MM' hết nghỉ — <= break_start = nghỉ qua nửa đêm
+    grace_minutes INTEGER NOT NULL DEFAULT 10 CHECK (grace_minutes >= 0),
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS attendance_days (
+    id              TEXT PRIMARY KEY,
+    person_id       TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+    work_date       TEXT NOT NULL,
+    shift_id        TEXT REFERENCES shifts(id) ON DELETE SET NULL,
+    check_in_at     TEXT,
+    check_out_at    TEXT,
+    status          TEXT NOT NULL DEFAULT 'auto'
+                    CHECK (status IN ('auto', 'leave', 'trip', 'manual')),
+    manual_override INTEGER NOT NULL DEFAULT 0 CHECK (manual_override IN (0, 1)),
+    note            TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (person_id, work_date)
+);
+CREATE INDEX IF NOT EXISTS idx_attendance_person_date
+    ON attendance_days(person_id, work_date DESC);
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_days(work_date);
 """
 
 # BLOB -> literal X'hex' nhúng trong SQL (thay cho tham số — REST chỉ nhận string)

@@ -70,6 +70,19 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def cleanup() -> None:
+    # RecognitionService giờ mở thêm DB qua AttendanceService (chấm công) —
+    # đóng mọi connection sqlite còn sống trước khi xóa file (Windows khóa).
+    import gc
+
+    gc.collect()
+    import sqlite3
+
+    for obj in gc.get_objects():
+        if isinstance(obj, sqlite3.Connection):
+            try:
+                obj.close()
+            except sqlite3.Error:
+                pass
     for suffix in ("", "-wal", "-shm"):
         Path(str(TEMP_DB) + suffix).unlink(missing_ok=True)
     for f in TEMP_THUMBS.glob("*.jpg"):

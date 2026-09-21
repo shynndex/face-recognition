@@ -68,6 +68,12 @@ class Config:
     security_answer_hash_2: str | None = None
     # Tự khóa app khi không dùng (phút) — 0 = tắt (mặc định); 1/5/15 = bật
     idle_lock_minutes: int = 0
+    # Chấm công (attendance-spec FR-6): ngày làm việc trong tuần
+    # (Monday=0 … Sunday=6) — dùng đánh vắng mặt + tô nền báo cáo
+    attendance_workdays: list[int] = None  # type: ignore[assignment]  # None → __post_init__ điền [0..4]
+    # Lương thô (mở rộng FR-8): đơn giá tiền cho 1 công quy đổi (VND) —
+    # lương = số công × hệ số ca × đơn giá. 0 = chưa đặt (chỉ ra công quy đổi).
+    attendance_pay_rate: int = 0
     sync_enabled: bool = False       # bật/tắt đồng bộ cloud (Bước 15)
     # Thông tin Cloudflare D1 (Bước 15) — rỗng = chưa cấu hình
     cloud_account_id: str = ""       # Account ID (dash.cloudflare.com → trang tổng quan)
@@ -90,6 +96,15 @@ class Config:
                 self.recognition_threshold,
             )
             self.recognition_threshold = 0.40
+        # attendance_workdays: list[int] mutable default (None → T2–T6)
+        if self.attendance_workdays is None:
+            self.attendance_workdays = [0, 1, 2, 3, 4]
+        else:
+            self.attendance_workdays = [
+                int(d) for d in self.attendance_workdays if 0 <= int(d) <= 6
+            ]
+        # Đơn giá 1 công quy đổi: số nguyên không âm (0 = chưa đặt)
+        self.attendance_pay_rate = max(0, int(self.attendance_pay_rate or 0))
 
     # -------------------------------------------------------------
     # Đọc / ghi config

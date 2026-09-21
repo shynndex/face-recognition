@@ -36,6 +36,9 @@ EXPECTED_TABLES = {
     "recognition_events",
     "sync_outbox",
     "settings",
+    "shifts",
+    "attendance_days",
+    "attendance_audit",
 }
 
 passed = True
@@ -65,7 +68,7 @@ def main() -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
         tables = {r["name"] for r in rows if not r["name"].startswith("sqlite_")}
-        check("đủ 5 bảng", EXPECTED_TABLES.issubset(tables))
+        check("đủ 8 bảng (gồm chấm công)", EXPECTED_TABLES.issubset(tables))
         check(
             "PRAGMA foreign_keys = ON",
             conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1,
@@ -74,7 +77,7 @@ def main() -> None:
             "PRAGMA journal_mode = WAL",
             conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal",
         )
-        check("user_version = 1", conn.execute("PRAGMA user_version").fetchone()[0] == 1)
+        check("user_version = 3", conn.execute("PRAGMA user_version").fetchone()[0] == 3)
 
     # ---- 2) Person CRUD ----
     print("\n[2] Person CRUD")
